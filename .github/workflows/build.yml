@@ -1,0 +1,77 @@
+name: Build npm package
+
+on:
+  workflow_call:
+    inputs:
+      cache-dependencies:
+        type: boolean
+        default: true
+      retention-days:
+        type: number
+        default: 7
+    outputs:
+      artifact-id:
+        value: ${{ jobs.build.outputs.artifact-id }}
+
+permissions:
+  contents: read
+
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  build:
+    name: Linux x64
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    outputs:
+      artifact-id: ${{ steps.upload.outputs.artifact-id }}
+    steps:
+      - name: Check out source
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          persist-credentials: false
+
+      - name: Set up Node.js
+        uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1
+        with:
+          node-version-file: .node-version
+          cache: ${{ inputs.cache-dependencies && 'npm' || '' }}
+          package-manager-cache: false
+
+      - name: Set up pinned npm
+        run: npm install --global "npm@$(cat .npm-version)" --ignore-scripts --no-audit --no-fund
+
+      - name: Install build dependencies
+        run: npm ci --ignore-scripts --no-audit --no-fund
+
+      - name: Check JavaScript syntax
+        run: npm run check
+
+      - name: Build npm package
+        run: npm run package
+
+      - name: Verify checksums
+        working-directory: dist
+        run: sha256sum --check --strict SHA256SUMS
+
+      - name: Inspect and install npm package
+        run: |
+          tar -tzf dist/*.tgz
+          npm install --global --prefix "$RUNNER_TEMP/kuberikon-install" \
+            --cache "$RUNNER_TEMP/kuberikon-cache" --offline --ignore-scripts --no-audit --no-fund \
+            "$PWD"/dist/*.tgz
+          "$RUNNER_TEMP/kuberikon-install/bin/kuberikon" --version
+          "$RUNNER_TEMP/kuberikon-install/bin/kuberikon" --help
+
+      - name: Upload release files
+        id: upload
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9
+        with:
+          name: kuberikon-npm-linux-x64
+          if-no-files-found: error
+          retention-days: ${{ inputs.retention-days }}
+          path: |
+            dist/*.tgz
+            dist/SHA256SUMS
