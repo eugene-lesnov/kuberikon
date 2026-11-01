@@ -1,0 +1,174 @@
+name: Release
+
+on:
+  push:
+    tags: ['[0-9]*']
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: release-${{ github.repository }}
+  cancel-in-progress: false
+  queue: max
+
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  validate:
+    name: Validate release tag
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    outputs:
+      version: ${{ steps.metadata.outputs.version }}
+      commit: ${{ steps.metadata.outputs.commit }}
+    steps:
+      - name: Check out release commit
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Validate version and branch ancestry
+        id: metadata
+        env:
+          DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
+        run: |
+          if [[ "$GITHUB_REF_TYPE" != tag ]]; then
+            echo 'Release must run on an existing version tag.' >&2
+            exit 1
+          fi
+          if ! git merge-base --is-ancestor HEAD "refs/remotes/origin/$DEFAULT_BRANCH"; then
+            echo 'Release commit must belong to the default branch.' >&2
+            exit 1
+          fi
+          printf 'commit=%s\n' "$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
+          node --input-type=module <<'NODE'
+          import { appendFileSync, readFileSync } from 'node:fs';
+          const { version } = JSON.parse(readFileSync('package.json', 'utf8'));
+          if (!/^(0|[1-9]\d*)\.(0|[1-9]\d*)\.(0|[1-9]\d*)$/.test(version)) {
+            throw new Error('Release version must use a stable major.minor.patch');
+          }
+          if (process.env.GITHUB_REF_NAME !== version) {
+            throw new Error(`Release tag must equal ${version}`);
+          }
+          appendFileSync(process.env.GITHUB_OUTPUT, `version=${version}\n`);
+          NODE
+
+  build:
+    name: Build
+    needs: validate
+    uses: ./.github/workflows/build.yml
+    with:
+      cache-dependencies: false
+      retention-days: 30
+
+  publish:
+    name: Publish npm and GitHub releases
+    needs: [validate, build]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    permissions:
+      contents: write
+      id-token: write
+      attestations: write
+    steps:
+      - name: Check out validated release commit
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          ref: ${{ needs.validate.outputs.commit }}
+          persist-credentials: false
+
+      - name: Set up Node.js
+        uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1
+        with:
+          node-version-file: .node-version
+          package-manager-cache: false
+
+      - name: Set up npm for trusted publishing
+        run: npm install --global "npm@$(cat .npm-version)" --ignore-scripts --no-audit --no-fund
+
+      - name: Download release files
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333
+        with:
+          artifact-ids: ${{ needs.build.outputs.artifact-id }}
+          merge-multiple: true
+          path: dist
+
+      - name: Verify downloaded checksums
+        working-directory: dist
+        run: sha256sum --check --strict SHA256SUMS
+
+      - name: Verify release tag before publishing
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          RELEASE_TAG: ${{ github.ref_name }}
+          RELEASE_COMMIT: ${{ needs.validate.outputs.commit }}
+        run: |
+          current_commit="$(gh api "repos/$GH_REPO/commits/$RELEASE_TAG" --jq .sha)"
+          if [[ "$current_commit" != "$RELEASE_COMMIT" ]]; then
+            echo 'Release tag moved after validation.' >&2
+            exit 1
+          fi
+
+      - name: Attest release files
+        if: github.event.repository.visibility == 'public' || vars.ENABLE_ARTIFACT_ATTESTATIONS == 'true'
+        uses: actions/attest@1e69f48acb82d1966a394da916b4c1698aa569d6
+        with:
+          subject-path: dist/*
+
+      - name: Publish npm package
+        id: npm
+        run: npm run release:npm
+
+      - name: Publish complete release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          RELEASE_TAG: ${{ github.ref_name }}
+          RELEASE_VERSION: ${{ needs.validate.outputs.version }}
+          RELEASE_COMMIT: ${{ needs.validate.outputs.commit }}
+          RELEASE_LATEST: ${{ steps.npm.outputs.latest }}
+        run: |
+          current_commit="$(gh api "repos/$GH_REPO/commits/$RELEASE_TAG" --jq .sha)"
+          if [[ "$current_commit" != "$RELEASE_COMMIT" ]]; then
+            echo 'Release tag moved after validation.' >&2
+            exit 1
+          fi
+          release="$(gh api --paginate --slurp "repos/$GH_REPO/releases?per_page=100" |
+            jq -c --arg tag "$RELEASE_TAG" '[.[][] | select(.tag_name == $tag)] | first // empty')"
+          if [[ -z "$release" ]]; then
+            release="$(gh api --method POST "repos/$GH_REPO/releases" \
+              -f tag_name="$RELEASE_TAG" -f target_commitish="$RELEASE_COMMIT" \
+              -f name="kuberikon $RELEASE_VERSION" \
+              -F draft=true -F generate_release_notes=true)"
+          fi
+          if [[ "$(jq -r .target_commitish <<< "$release")" != "$RELEASE_COMMIT" ]]; then
+            echo 'Existing draft targets a different commit.' >&2
+            exit 1
+          fi
+          for file in dist/*; do
+            asset="$(jq -c --arg name "$(basename "$file")" '.assets[] | select(.name == $name)' <<< "$release")"
+            if [[ -n "$asset" ]]; then
+              digest="$(sha256sum "$file" | cut -d ' ' -f 1)"
+              if [[ "$(jq -r .digest <<< "$asset")" != "sha256:$digest" ]]; then
+                echo "Existing asset differs: $(basename "$file")." >&2
+                exit 1
+              fi
+            else
+              if [[ "$(jq -r .draft <<< "$release")" != true ]]; then
+                echo "Published release is missing asset: $(basename "$file")." >&2
+                exit 1
+              fi
+              gh release upload "$RELEASE_TAG" "$file"
+            fi
+          done
+          if [[ "$(jq -r .draft <<< "$release")" == true ]]; then
+            gh release edit "$RELEASE_TAG" --draft=false --prerelease=false "--latest=$RELEASE_LATEST"
+          else
+            echo 'Release is already published with the same files.'
+          fi
