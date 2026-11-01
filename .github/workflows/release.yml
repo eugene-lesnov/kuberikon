@@ -67,7 +67,7 @@ jobs:
       retention-days: 30
 
   publish:
-    name: Publish npm and GitHub releases
+    name: Publish GitHub release
     needs: [validate, build]
     runs-on: ubuntu-24.04
     timeout-minutes: 15
@@ -81,15 +81,6 @@ jobs:
         with:
           ref: ${{ needs.validate.outputs.commit }}
           persist-credentials: false
-
-      - name: Set up Node.js
-        uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1
-        with:
-          node-version-file: .node-version
-          package-manager-cache: false
-
-      - name: Set up npm for trusted publishing
-        run: npm install --global "npm@$(cat .npm-version)" --ignore-scripts --no-audit --no-fund
 
       - name: Download release files
         uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333
@@ -121,10 +112,6 @@ jobs:
         with:
           subject-path: dist/*
 
-      - name: Publish npm package
-        id: npm
-        run: npm run release:npm
-
       - name: Publish complete release
         env:
           GH_TOKEN: ${{ github.token }}
@@ -132,15 +119,24 @@ jobs:
           RELEASE_TAG: ${{ github.ref_name }}
           RELEASE_VERSION: ${{ needs.validate.outputs.version }}
           RELEASE_COMMIT: ${{ needs.validate.outputs.commit }}
-          RELEASE_LATEST: ${{ steps.npm.outputs.latest }}
         run: |
           current_commit="$(gh api "repos/$GH_REPO/commits/$RELEASE_TAG" --jq .sha)"
           if [[ "$current_commit" != "$RELEASE_COMMIT" ]]; then
             echo 'Release tag moved after validation.' >&2
             exit 1
           fi
-          release="$(gh api --paginate --slurp "repos/$GH_REPO/releases?per_page=100" |
-            jq -c --arg tag "$RELEASE_TAG" '[.[][] | select(.tag_name == $tag)] | first // empty')"
+          releases="$(gh api --paginate --slurp "repos/$GH_REPO/releases?per_page=100")"
+          release="$(jq -c --arg tag "$RELEASE_TAG" '[.[][] | select(.tag_name == $tag)] | first // empty' <<< "$releases")"
+          latest_version="$(
+            {
+              printf '%s\n' "$RELEASE_VERSION"
+              jq -r '.[][] | select(.draft == false and .prerelease == false) | .tag_name | select(test("^(0|[1-9][0-9]*)[.](0|[1-9][0-9]*)[.](0|[1-9][0-9]*)$"))' <<< "$releases"
+            } | sort -V | tail -n 1
+          )"
+          release_latest=false
+          if [[ "$RELEASE_VERSION" == "$latest_version" ]]; then
+            release_latest=true
+          fi
           if [[ -z "$release" ]]; then
             release="$(gh api --method POST "repos/$GH_REPO/releases" \
               -f tag_name="$RELEASE_TAG" -f target_commitish="$RELEASE_COMMIT" \
@@ -168,7 +164,58 @@ jobs:
             fi
           done
           if [[ "$(jq -r .draft <<< "$release")" == true ]]; then
-            gh release edit "$RELEASE_TAG" --draft=false --prerelease=false "--latest=$RELEASE_LATEST"
+            gh release edit "$RELEASE_TAG" --draft=false --prerelease=false "--latest=$release_latest"
           else
             echo 'Release is already published with the same files.'
           fi
+
+  publish-npm:
+    name: Publish npm package
+    needs: [validate, build, publish]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    permissions:
+      contents: read
+      id-token: write
+    steps:
+      - name: Check out validated release commit
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          ref: ${{ needs.validate.outputs.commit }}
+          persist-credentials: false
+
+      - name: Set up Node.js
+        uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1
+        with:
+          node-version-file: .node-version
+          package-manager-cache: false
+
+      - name: Set up npm for trusted publishing
+        run: npm install --global "npm@$(cat .npm-version)" --ignore-scripts --no-audit --no-fund
+
+      - name: Download release files
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333
+        with:
+          artifact-ids: ${{ needs.build.outputs.artifact-id }}
+          merge-multiple: true
+          path: dist
+
+      - name: Verify downloaded checksums
+        working-directory: dist
+        run: sha256sum --check --strict SHA256SUMS
+
+      - name: Verify release tag before npm publication
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          RELEASE_TAG: ${{ github.ref_name }}
+          RELEASE_COMMIT: ${{ needs.validate.outputs.commit }}
+        run: |
+          current_commit="$(gh api "repos/$GH_REPO/commits/$RELEASE_TAG" --jq .sha)"
+          if [[ "$current_commit" != "$RELEASE_COMMIT" ]]; then
+            echo 'Release tag moved after validation.' >&2
+            exit 1
+          fi
+
+      - name: Publish npm package
+        run: npm run release:npm
