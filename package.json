@@ -1,0 +1,48 @@
+{
+  "name": "kuberikon",
+  "version": "0.1.0",
+  "license": "MIT",
+  "description": "Linux TUI for Kubernetes profiles, port forwards and pod logs",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/eugene-lesnov/kuberikon.git"
+  },
+  "homepage": "https://github.com/eugene-lesnov/kuberikon#readme",
+  "bugs": {
+    "url": "https://github.com/eugene-lesnov/kuberikon/issues"
+  },
+  "publishConfig": {
+    "access": "public",
+    "registry": "https://registry.npmjs.org/"
+  },
+  "type": "module",
+  "bin": {
+    "kuberikon": "bin/kuberikon.js"
+  },
+  "files": [
+    "bin/kuberikon.js",
+    "dist/kuberikon.mjs",
+    "dist/assets/@opentui/core-linux-x64/libopentui.so",
+    "dist/THIRD_PARTY_NOTICES.txt"
+  ],
+  "os": ["linux"],
+  "cpu": ["x64"],
+  "libc": ["glibc"],
+  "engines": {
+    "node": ">=26.4.0 <27"
+  },
+  "scripts": {
+    "start": "node --experimental-ffi src/main.js",
+    "build": "node scripts/build.js",
+    "package": "npm run build && node scripts/package.js",
+    "release:npm": "node scripts/publish.js",
+    "prepare": "npm run build",
+    "check": "node scripts/check.js"
+  },
+  "devDependencies": {
+    "@opentui/core": "0.8.0",
+    "esbuild": "0.28.2",
+    "string-width": "7.2.0",
+    "yaml": "2.9.1"
+  }
+}
