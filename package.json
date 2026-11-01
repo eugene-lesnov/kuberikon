@@ -1,6 +1,6 @@
 {
   "name": "kuberikon",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "license": "MIT",
   "description": "Linux TUI for Kubernetes profiles, port forwards and pod logs",
   "repository": {
@@ -25,9 +25,15 @@
     "dist/assets/@opentui/core-linux-x64/libopentui.so",
     "dist/THIRD_PARTY_NOTICES.txt"
   ],
-  "os": ["linux"],
-  "cpu": ["x64"],
-  "libc": ["glibc"],
+  "os": [
+    "linux"
+  ],
+  "cpu": [
+    "x64"
+  ],
+  "libc": [
+    "glibc"
+  ],
   "engines": {
     "node": ">=26.4.0 <27"
   },
