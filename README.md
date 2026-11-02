@@ -141,12 +141,7 @@ Settings are saved in `~/.config/kuberikon/settings.json`; UI state is in
 override these locations. Kubeconfig credentials are not copied into settings.
 
 **F9 → Storage and recovery** shows file paths and can restore the last valid
-settings backup in a supported schema.
-
-The current settings schema is version 6. Earlier schemas are not migrated
-automatically and cannot be loaded by this build. Keep a separate copy of your
-settings before upgrading; a backup using an earlier schema cannot be restored
-through Storage and recovery either.
+settings backup.
 
 ## Build from source
 
