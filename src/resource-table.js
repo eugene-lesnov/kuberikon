@@ -1,4 +1,4 @@
-import { MouseButton, ScrollBoxRenderable, StyledText, fg } from '@opentui/core';
+import { MouseButton, ScrollBoxRenderable, StyledText, bold, fg } from '@opentui/core';
 import { cell, clean, oneLine, statusLabel, hostLabel, age, fitColumns } from './text.js';
 import { t } from './i18n/index.js';
 import { favoriteKey } from './config.js';
@@ -219,12 +219,24 @@ export class ResourceTable {
     if (item.forwardIds) {
       const members = new Map(app.forwards.records.map(record => [record.id, record]));
       const targets = new Map(app.templateGroup(item).forwardIds.map(id => members.get(id)).map(record => [app.forwardKey(record.spec), record]));
-      return [item.name, '', t('details.profile', { name: app.profile?.name ?? t('app.noProfile') }),
-        t(item.autostart ? 'group.autoOn' : 'group.autoOff'), '', ...item.forwardIds.map(id => {
-        const record = members.get(id);
+      const records = item.forwardIds.map(id => members.get(id));
+      const heading = records.every(record => record.spec.kind === 'service') ? 'details.services' : 'details.resources';
+      const chunks = [
+        fg(app.colors.text)([item.name, '', t('details.profile', { name: app.profile?.name ?? t('app.noProfile') }),
+          t(item.autostart ? 'group.autoOn' : 'group.autoOff')].join('\n') + '\n\n'),
+        fg(app.colors.muted)(bold(t(heading, { count: records.length }))),
+      ];
+      for (const record of records) {
         const target = targets.get(app.forwardKey(record.spec));
-        return `${record.spec.namespace}/${record.spec.name}\n${record.spec.localPort} → ${record.spec.remotePort} · ${statusLabel(target?.status ?? 'stopped')}${target?.info ? '\n' + clean(target.info) : ''}`;
-      })].join('\n');
+        const status = statusLabel(target?.status ?? 'stopped');
+        const info = clean(target?.info).trim();
+        chunks.push(fg(app.colors.accent)(bold(`\n• ${record.spec.namespace}/${record.spec.name}\n`)),
+          fg(app.colors.text)(`    ${record.spec.localPort} → ${record.spec.remotePort} · `),
+          fg(app.colors.muted)(status + '\n'));
+        if (info && info !== status) chunks.push(fg(target.status === 'error' ? app.colors.error : app.colors.muted)(
+          info.split('\n').map(line => `    ${line}`).join('\n') + '\n'));
+      }
+      return new StyledText(chunks);
     }
     const detail = item.compact && app.profile && app.podDetail?.key === app.cluster.backend().resourceKey(app.profile, item) ? app.podDetail : null;
     if (detail?.value) item = { ...item, ...detail.value, status: item.status, ready: item.ready, restarts: item.restarts };
@@ -258,8 +270,13 @@ export class ResourceTable {
     const app = this.app;
     if (app.closing || app.renderer.hasSelection) return;
     if (!app.modal) app.cluster.schedulePodDetails(this.current());
-    const content = this.describe(this.current());
-    if (this.detailsContent !== content) { app.detailText.content = content; this.detailsContent = content; }
+    this.updateDescription(app.detailText, this.current());
+  }
+
+  updateDescription(text, item) {
+    const content = this.describe(item);
+    const value = content instanceof StyledText ? content.chunks.map(chunk => chunk.text).join('') : content;
+    if (text.detailsContent !== value) { text.content = content; text.detailsContent = value; }
   }
 
   showDetails(item = this.current()) {
@@ -269,13 +286,12 @@ export class ResourceTable {
     const modal = app.showModal(t('details.title'), { width: 86, height: Math.min(25, app.renderer.height - 2) });
     const scroll = new ScrollBoxRenderable(app.renderer, { flexGrow: 1, scrollY: true, scrollX: false });
     modal.dialog.add(scroll);
-    const text = app.text(scroll, this.describe(item), { width: '100%', selectable: true, wrapMode: 'word', flexShrink: 0 });
-    let previous = this.describe(item);
+    const text = app.text(scroll, '', { width: '100%', selectable: true, wrapMode: 'word', flexShrink: 0 });
     modal.refresh = () => {
       const current = item.spec ? app.forwards.records.find(record => record.id === item.id) : item;
-      const content = this.describe(current);
-      if (previous !== content) { text.content = content; previous = content; }
+      this.updateDescription(text, current);
     };
+    modal.refresh();
     const buttons = app.buttonRow(modal.dialog, { footer: true });
     const close = app.button(buttons, t('dialog.close'), () => app.closeModal());
     modal.focusables = [scroll, close];

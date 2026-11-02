@@ -5,6 +5,7 @@ import { emptySettings, validateSettings } from '../src/config.js';
 import { ForwardManager } from '../src/forwards.js';
 import { ManagementDialogs } from '../src/management.js';
 import { KuberikonApp } from '../src/ui.js';
+import { suggestTemplatePort, validateTemplatePorts } from '../src/ports.js';
 
 const profiles = ['dev', 'stage'].map(id => ({ id, name: id, mode: 'live', file: `/tmp/${id}.kuber`, context: id, namespace: 'default' }));
 const spec = { kind: 'service', name: 'api', namespace: 'default', localPort: 18080, remotePort: 'http', address: 'localhost' };
@@ -743,4 +744,211 @@ test('shared bracket ordering preserves favorite behavior', async t => {
   assert.equal(app.resourceTable.current().name, 'api');
   mockInput.pressKey('[');
   await waitFor(() => app.store.data.favorites[0].target.name === 'api');
+});
+
+test('template port suggestions avoid draft members and retain manual overrides', async t => {
+  const saved = { id: 'saved', profileId: 'stage', spec: { ...spec, name: 'db', localPort: 8080 } };
+  const pending = { id: 'pending', profileId: null, spec: { ...spec, name: 'cache', localPort: 8081 } };
+  const { app, mockInput, renderOnce } = await uiHarness(t, 100, 32, [saved]);
+  let added;
+  app.configureGroupForward({ ...resource, ports: [...resource.ports, { name: 'metrics', port: 9090 }] }, app.profile,
+    { draft: { forwardIds: ['saved', 'pending'] }, pending: [pending] }, record => { added = record; }, () => {});
+  await renderOnce();
+  const modal = app.modal;
+  const local = modal.controls.get('localPort');
+  assert.equal(local.value, '8082');
+  mockInput.pressArrow('down');
+  assert.equal(local.value, '9090');
+  local.value = '20000';
+  mockInput.pressArrow('up');
+  assert.equal(local.value, '20000');
+  local.value = '8080';
+  await modal.submit();
+  await renderOnce();
+  assert.equal(added, undefined);
+  assert.equal(app.modal, modal);
+  local.value = '8082';
+  await modal.submit();
+  assert.equal(added.spec.localPort, 8082);
+  assert.equal(added.spec.remotePort, 'http');
+});
+
+test('template ports respect listen addresses and wrap within the valid port range', () => {
+  const listener = { spec: { ...spec, address: '127.0.0.1', localPort: 65535 } };
+  assert.equal(suggestTemplatePort(65535, 'localhost', [listener]), 1);
+  assert.equal(suggestTemplatePort(65535, '127.0.0.2', [listener]), 65535);
+  assert.doesNotThrow(() => validateTemplatePorts([listener, { spec: { ...listener.spec, address: '127.0.0.2' } }]));
+  for (const address of ['localhost', '0.0.0.0', '::']) {
+    assert.throws(() => validateTemplatePorts([listener, { spec: { ...listener.spec, address } }]), /overlap/);
+  }
+});
+
+test('conflicting saved template members fail before saving or starting any connections', async t => {
+  const { app } = await uiHarness(t, 100, 32, [
+    { id: 'api', profileId: 'dev', spec },
+    { id: 'db', profileId: 'stage', spec: { ...spec, name: 'db' } },
+  ]);
+  const group = { id: 'backend', name: 'Backend', autostart: false, forwardIds: ['api', 'db'] };
+  app.editGroup(group);
+  const modal = app.modal;
+  await modal.submit();
+  assert.equal(app.modal, modal);
+  assert.deepEqual(app.store.data.groups, []);
+  await assert.rejects(app.startTemplate(group), /overlap/);
+  assert.equal(app.store.data.forwards.length, 2);
+  assert.equal(app.forwards.sessions.size, 0);
+});
+
+test('forward choices resolve the latest record while preserving the displayed action', async t => {
+  const { app, mockInput, waitFor } = await uiHarness(t, 100, 32, [
+    { id: 'a', profileId: 'dev', spec },
+    { id: 'b', profileId: 'dev', spec: { ...spec, localPort: 18082 } },
+  ]);
+  const choices = [];
+  const choose = () => app.chooseResourceForward((record, start) => choices.push({ record, start }), resource);
+  choose();
+  mockInput.pressArrow('down');
+  await app.forwards.start({ id: 'b' });
+  mockInput.pressEnter();
+  await waitFor(() => choices.length === 1);
+  assert.equal(choices[0].record.id, 'b');
+  assert.equal(choices[0].record.status, 'running');
+  assert.equal(choices[0].start, true);
+  choose();
+  mockInput.pressArrow('down');
+  await app.forwards.stop({ id: 'b' });
+  await app.persist(data => { data.forwards = data.forwards.filter(record => record.id !== 'b'); return data; });
+  mockInput.pressEnter();
+  await waitFor(() => !app.modal);
+  assert.equal(choices.length, 1);
+});
+
+test('direct forward controls use current session state even with an older row', async t => {
+  const { app } = await uiHarness(t, 100, 32);
+  const stopped = app.forwards.records[0];
+  await app.forwards.start(stopped);
+  const running = app.forwards.records[0];
+  await app.controlCurrent(stopped);
+  assert.equal(app.forwards.records[0].status, 'stopped');
+  await app.controlCurrent(running);
+  assert.equal(app.forwards.records[0].status, 'running');
+});
+
+test('deleting and editing templates remove only their unreferenced portable presets', async t => {
+  const { app, mockInput, waitFor } = await uiHarness(t, 100, 32, [
+    { id: 'owned', profileId: null, spec: { ...spec, localPort: 18083 } },
+    { id: 'shared', profileId: null, spec: { ...spec, name: 'db', localPort: 15432 } },
+    { id: 'connection', profileId: 'dev', spec },
+    { id: 'unrelated', profileId: null, spec: { ...spec, name: 'cache', localPort: 16379 } },
+  ]);
+  app.store.data.groups = [
+    { id: 'backend', name: 'Backend', autostart: false, forwardIds: ['owned', 'shared', 'connection'] },
+    { id: 'database', name: 'Database', autostart: false, forwardIds: ['shared'] },
+  ];
+  await app.forwards.start({ id: 'connection' });
+  app.deleteGroup(app.store.data.groups[0]);
+  app.navigation.focus(app.modal.focusables.at(-1));
+  mockInput.pressEnter();
+  await waitFor(() => app.store.data.groups.length === 1);
+  assert.deepEqual(app.store.data.forwards.map(record => record.id), ['shared', 'connection', 'unrelated']);
+  assert.equal(app.forwards.records.find(record => record.id === 'connection').status, 'running');
+  const edit = () => {
+    app.editGroup(app.store.data.groups[0]);
+    mockInput.pressKey('r');
+  };
+  edit();
+  app.cancelModal();
+  assert.ok(app.store.data.forwards.some(record => record.id === 'shared'));
+  edit();
+  await app.modal.submit();
+  assert.deepEqual(app.store.data.groups[0].forwardIds, []);
+  assert.deepEqual(app.store.data.forwards.map(record => record.id), ['connection', 'unrelated']);
+  assert.equal(app.forwards.records.find(record => record.id === 'connection').status, 'running');
+});
+
+test('idle tables keep their forward index and update connection labels on change events', async t => {
+  const { app } = await uiHarness(t, 100, 32);
+  await app.toggleFavorite(resource);
+  const labels = t.mock.method(app.resourceTable, 'updateRowLabels');
+  for (const tab of ['services', 'favorites', 'forwards']) {
+    await app.switchTab(tab);
+    await new Promise(setImmediate);
+    app.cluster.nextRefreshAt = Infinity;
+    app.resourceTable.relatedForwards(resource);
+    const index = app.resourceTable.relatedIndex;
+    const calls = labels.mock.callCount();
+    app.tick();
+    assert.equal(labels.mock.callCount(), calls, `${tab} must not rebuild static labels on a timer`);
+    assert.equal(app.resourceTable.relatedIndex, index);
+  }
+  await app.switchTab('services');
+  await new Promise(setImmediate);
+  const calls = labels.mock.callCount();
+  await app.forwards.start({ id: 'dev-api' });
+  await new Promise(setImmediate);
+  assert.ok(labels.mock.callCount() > calls);
+  assert.equal(app.resourceTable.relatedForwards(resource)[0].status, 'running');
+  await app.switchTab('pods');
+  const podCalls = labels.mock.callCount();
+  app.tick();
+  assert.equal(labels.mock.callCount(), podCalls + 1);
+});
+
+test('retry countdowns stay current in resource cards and the forwards table', async t => {
+  const { app } = await uiHarness(t, 100, 32);
+  await app.forwards.start({ id: 'dev-api' });
+  const session = app.forwards.sessions.get('dev-api');
+  app.forwards.restart(session, 'Lost connection');
+  await new Promise(setImmediate);
+  assert.equal(session.status, 'retrying');
+  await app.resourceTable.showDetails(resource);
+  const before = app.resourceTable.relatedForwards(resource)[0].info;
+  session.retryAt = Date.now() + 12000;
+  app.tick();
+  const after = app.resourceTable.relatedForwards(resource)[0].info;
+  assert.notEqual(after, before);
+  assert.equal(after, app.forwards.records[0].info);
+  app.closeModal();
+  await app.switchTab('forwards');
+  session.retryAt = Date.now() + 9000;
+  app.tick();
+  assert.equal(app.resourceTable.current().info, app.forwards.records[0].info);
+  assert.ok(app.detailText.plainText.includes(app.forwards.records[0].info));
+});
+
+test('template details separate services and keep diagnostics without repeating status', async t => {
+  const { app, renderOnce } = await uiHarness(t, 140, 40, [
+    { id: 'api', profileId: 'dev', spec },
+    { id: 'db', profileId: 'dev', spec: { ...spec, name: 'db', localPort: 15432 } },
+  ]);
+  const group = { id: 'backend', name: 'Backend', autostart: false, forwardIds: ['api', 'db'] };
+  app.store.data.groups = [group];
+  await app.forwards.start({ id: 'api' });
+  await app.forwards.stop({ id: 'api' });
+  app.live.prepareForward = async () => { throw new Error('Connection failed\nCheck credentials'); };
+  await app.forwards.start({ id: 'db' });
+  await app.switchTab('groups');
+  await renderOnce();
+  const details = app.detailText.plainText;
+  assert.match(details, /Autostart: OFF\n\nServices · 2\n• default\/api/);
+  assert.match(details, /• default\/api\n    18080 → http · Stopped\n\n• default\/db/);
+  assert.match(details, /• default\/db\n    15432 → http · Error\n    Connection failed\n    Check credentials/);
+  assert.doesNotMatch(details, /─/);
+  assert.equal(details.match(/Stopped/g).length, 1);
+  const chunks = app.detailText.content.chunks;
+  const name = chunks.find(chunk => chunk.text.includes('• default/api'));
+  const status = chunks.find(chunk => chunk.text === 'Stopped\n');
+  assert.ok(!name.fg.equals(status.fg));
+  app.resourceTable.showDetails();
+  await renderOnce();
+  const text = app.modal.focusables[0].getChildren()[0];
+  assert.equal(text.plainText, details);
+  const previous = text.content;
+  app.modal.refresh();
+  assert.equal(text.content, previous);
+  app.live.prepareForward = async () => ({});
+  await app.forwards.start({ id: 'db' });
+  app.modal.refresh();
+  assert.match(text.plainText, /• default\/db\n    15432 → http · Running/);
+  assert.doesNotMatch(text.plainText, /Check credentials/);
 });

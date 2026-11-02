@@ -409,14 +409,16 @@ export class KuberikonApp extends ManagementDialogs {
     else if (item?.forwardIds) this.deleteGroup(item);
   }
 
-  controlCurrent(record = this.resourceTable.current()) {
+  controlCurrent(record = this.resourceTable.current(), start) {
     if (record?.forwardIds) {
       const group = this.templateGroup(record);
       return this.forwards.isActive(group) ? this.forwards.stopGroup(group) : this.startTemplate(record);
     }
     if (!record?.spec) { this.setStatus(t('status.startHint')); return; }
+    record = this.forwards.records.find(item => item.id === record.id);
+    if (!record) return;
     if (record.status === 'stopping') return;
-    return record.want ? this.forwards.stop(record) : this.forwards.start(record);
+    return (start ?? !record.want) ? this.forwards.start(record) : this.forwards.stop(record);
   }
 
   tick() {
@@ -425,12 +427,13 @@ export class KuberikonApp extends ManagementDialogs {
     if (this.cluster.currentLoad?.phase === 'loading') this.updateHeader();
     this.refreshButtons();
     if (!this.logs && !this.small) {
-      this.resourceTable.relatedIndex = null;
-      if (this.tab === 'forwards') {
+      const retrying = [...this.forwards.sessions.values()].some(session => session.status === 'retrying');
+      if (retrying) this.resourceTable.relatedIndex = null;
+      if (this.tab === 'forwards' && retrying) {
         const records = new Map(this.forwards.records.map(record => [record.id, record]));
         this.visibleRows = this.visibleRows.map(record => ({ ...record, ...records.get(record.id) }));
       }
-      if (['pods', 'services', 'favorites', 'forwards'].includes(this.tab)) this.resourceTable.updateRowLabels();
+      if (this.tab === 'pods' || this.tab === 'forwards' && retrying) this.resourceTable.updateRowLabels();
       this.resourceTable.updateDetails();
     }
     if (this.logs?.sources.some(source => source.status === 'retrying')) this.updateLogMeta();

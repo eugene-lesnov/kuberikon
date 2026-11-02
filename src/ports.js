@@ -23,6 +23,29 @@ export function addressesOverlap(left, right) {
   return hosts(left).some(a => hosts(right).some(b => a === b || a === '0.0.0.0' && isIP(b) === 4 || b === '0.0.0.0' && isIP(a) === 4));
 }
 
+export function suggestTemplatePort(preferred, address, forwards) {
+  const reserved = new Set(forwards.filter(record => addressesOverlap(address, record.spec.address)).map(record => record.spec.localPort));
+  let candidate = Number(preferred);
+  if (!Number.isInteger(candidate) || candidate < 1 || candidate > 65535) candidate = 8080;
+  for (let attempt = 0; attempt <= reserved.size; attempt++) {
+    if (!reserved.has(candidate)) return candidate;
+    candidate = candidate === 65535 ? 1 : candidate + 1;
+  }
+  throw new Error(t('error.noFreePort'));
+}
+
+export function validateTemplatePorts(forwards) {
+  const byPort = new Map();
+  for (const { spec } of forwards) {
+    const addresses = byPort.get(spec.localPort) ?? [];
+    if (addresses.some(address => addressesOverlap(address, spec.address))) {
+      throw new Error(t('error.templatePortConflict', { address: spec.address, port: spec.localPort }));
+    }
+    addresses.push(spec.address);
+    byPort.set(spec.localPort, addresses);
+  }
+}
+
 async function probePort(address, port, signal, allowPermissionDenied = false) {
   if (signal?.aborted) throw new DOMException(t('error.requestCancelled'), 'AbortError');
   const servers = [];

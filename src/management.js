@@ -9,7 +9,7 @@ import { LogExport } from './logs.js';
 import { commandKey } from './controls.js';
 import { oneLine, statusLabel } from './text.js';
 import { t } from './i18n/index.js';
-import { declaredForwardPorts, suggestLocalPort } from './ports.js';
+import { declaredForwardPorts, suggestLocalPort, suggestTemplatePort, validateTemplatePorts } from './ports.js';
 import { Dialogs } from './dialogs.js';
 
 export class ManagementDialogs extends Dialogs {
@@ -135,7 +135,7 @@ export class ManagementDialogs extends Dialogs {
   async toggleForward(item = this.resourceTable.current()) {
     if (!item || item.spec || item.forwardIds) return;
     if (this.resourceTable.relatedForwards(item).length) {
-      return this.chooseResourceForward(record => this.controlCurrent(record), item, record => t(this.forwardAction(record)));
+      return this.chooseResourceForward((record, start) => this.controlCurrent(record, start), item, record => t(this.forwardAction(record)));
     }
     return this.openForward(item);
   }
@@ -193,6 +193,7 @@ export class ManagementDialogs extends Dialogs {
   async startTemplate(group) {
     if (!this.profile) { this.openProfiles(); return; }
     const existing = this.templateGroup(group);
+    validateTemplatePorts(group.forwardIds.map(id => this.templateIndex.sources.get(id)).filter(Boolean));
     if (existing.forwardIds.length === group.forwardIds.length) return this.forwards.startGroup(existing);
     const profileId = this.profile.id;
     let resolved;
@@ -352,11 +353,14 @@ export class ManagementDialogs extends Dialogs {
   chooseResourceForward(onChoose, item, label) {
     const records = this.resourceTable.relatedForwards(item);
     if (!records.length) return;
-    if (records.length === 1) return onChoose(records[0]);
+    if (records.length === 1) return onChoose(records[0], !records[0].want);
     this.pick(t('favorite.chooseForward'), records.map(record => ({
       name: `${record.spec.remotePort} → ${this.forwardAddress(record)}`,
-      description: [statusLabel(record.status), label?.(record)].filter(Boolean).join(' · '), value: record,
-    })), onChoose, `${item.namespace}/${item.kind}/${item.name}`);
+      description: [statusLabel(record.status), label?.(record)].filter(Boolean).join(' · '), value: { id: record.id, start: !record.want },
+    })), ({ id, start }) => {
+      const record = this.forwards.records.find(record => record.id === id);
+      if (record) return onChoose(record, start);
+    }, `${item.namespace}/${item.kind}/${item.name}`);
   }
 
   async moveSavedItem(direction, item = this.resourceTable.current()) {
@@ -473,10 +477,13 @@ export class ManagementDialogs extends Dialogs {
           }
           const saved = { id: draft.id, name: groupName, autostart: draft.autostart,
             forwardIds: [...new Set(draft.forwardIds.map(id => ids.get(id) ?? id))] };
+          const records = new Map(data.forwards.map(record => [record.id, record]));
+          validateTemplatePorts(saved.forwardIds.map(id => records.get(id)));
           const index = data.groups.findIndex(item => item.id === draft.id);
+          const previous = data.groups[index];
           if (index < 0) data.groups.push(saved);
           else data.groups[index] = saved;
-          return data;
+          return this.removeUnusedTemplateForwards(data, previous?.forwardIds ?? []);
         });
         this.forwards.cancelGroup(draft.id);
         if (this.closing || this.modal !== modal) return;
@@ -634,7 +641,9 @@ export class ManagementDialogs extends Dialogs {
   configureGroupForward(item, profile, state, onAdd, onBack) {
     const portOptions = item.ports.map(port => ({ name: `${port.name || port.port} · ${port.port}/TCP`,
       value: item.kind === 'service' && port.name ? port.name : String(port.port) }));
-    let suggestedLocalPort = item.ports[0]?.port ?? 8080;
+    const memberIds = new Set(state.draft?.forwardIds ?? state.pending.map(record => record.id));
+    const reserved = [...this.store.data.forwards, ...state.pending].filter(record => memberIds.has(record.id));
+    let suggestedLocalPort = suggestTemplatePort(item.ports[0]?.port ?? 8080, 'localhost', reserved);
     let values = { localPort: suggestedLocalPort, remotePort: portOptions[0]?.value ?? '8080', address: 'localhost' };
     const show = (advanced = false) => {
       const modal = this.form(t('group.configureForward'), [
@@ -645,6 +654,7 @@ export class ManagementDialogs extends Dialogs {
         ] : []),
       ], fields => {
         const spec = validateForward({ ...values, ...fields, kind: item.kind, namespace: item.namespace, name: item.name });
+        validateTemplatePorts([...reserved, { spec }]);
         const existing = [...this.store.data.forwards, ...state.pending].find(record =>
           !record.profileId && this.sameForward(record.spec, spec));
         onAdd(existing ?? { id: randomUUID(), profileId: null, spec });
@@ -653,7 +663,8 @@ export class ManagementDialogs extends Dialogs {
         description: `${oneLine(profile.name)} · ${oneLine(profile.context)}\n${item.namespace}/${item.kind}/${item.name}` });
       if (portOptions.length) modal.controls.get('remotePort').on('selectionChanged', () => {
         const selected = modal.controls.get('remotePort').getSelectedIndex();
-        const port = item.ports[selected].port;
+        const address = modal.controls.get('address')?.value.trim() ?? values.address;
+        const port = suggestTemplatePort(item.ports[selected].port, address, reserved);
         const local = modal.controls.get('localPort');
         if (local.value === String(suggestedLocalPort)) local.value = String(port);
         suggestedLocalPort = port;
@@ -675,8 +686,19 @@ export class ManagementDialogs extends Dialogs {
   deleteGroup(group) {
     this.confirm(t('group.delete'), t('group.deleteText', { name: group.name }), t('dialog.delete'), async () => {
       this.forwards.cancelGroup(group.id);
-      await this.persist(data => { data.groups = data.groups.filter(item => item.id !== group.id); return data; });
+      await this.persist(data => {
+        const removed = data.groups.find(item => item.id === group.id);
+        data.groups = data.groups.filter(item => item.id !== group.id);
+        return this.removeUnusedTemplateForwards(data, removed?.forwardIds ?? []);
+      });
     });
+  }
+
+  removeUnusedTemplateForwards(data, forwardIds) {
+    const candidates = new Set(forwardIds);
+    const referenced = new Set(data.groups.flatMap(group => group.forwardIds));
+    data.forwards = data.forwards.filter(record => record.profileId !== null || !candidates.has(record.id) || referenced.has(record.id));
+    return data;
   }
 
   settingsInfo() {
