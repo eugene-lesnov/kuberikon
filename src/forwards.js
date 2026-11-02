@@ -27,7 +27,7 @@ export class ForwardManager extends EventEmitter {
       const retry = session?.status === 'retrying' ? session.retryAt ? t('forward.retry', {
         attempt: session.retries, seconds: Math.max(0, Math.ceil((session.retryAt - Date.now()) / 1000)),
       }) : t(session.connection?.offline ? 'forward.networkUnavailable' : 'forward.reconnecting') : '';
-      return { ...configuration, profile: (session?.want || session?.handle ? session.profile : null) ?? this.profile(),
+      return { ...configuration, profile: (session?.want || session?.handle ? session.profile : null) ?? this.profile(configuration),
         status: session?.status ?? 'stopped', info: [session?.info, retry].filter(Boolean).join('\n'),
         journal: session?.journal ?? [], want: session?.want ?? false };
     });
@@ -57,8 +57,8 @@ export class ForwardManager extends EventEmitter {
     this.emit('change');
     session.pending = (async () => {
       try {
-        const profile = this.profile();
-        if (!profile) throw new Error(t('error.noProfile'));
+        const profile = this.profile(configuration);
+        if (!profile) throw new Error(t(configuration.profileId ? 'error.profileMissing' : 'error.forwardProfile'));
         session.profile = Object.freeze({ ...await this.resolveProfile({ ...profile }, session.controller.signal) });
         if (!session.want || this.closing || session.controller.signal.aborted) return;
         session.prepared = await this.backend(session.profile).prepareForward(session.configuration.spec, session.controller.signal);
@@ -262,11 +262,11 @@ export class ForwardManager extends EventEmitter {
     return session.stopping;
   }
 
-  async stopAll() {
-    this.groups.clear();
-    await Promise.all([...this.sessions.keys()].map(id => this.stop({ id })));
-    this.sessions.clear();
-    this.emit('change');
+  async stopProfile(profileId) {
+    const ids = new Set(this.configurations.filter(record => record.profileId === profileId).map(record => record.id));
+    for (const [id, operation] of this.groups) if (operation.forwardIds.some(id => ids.has(id))) this.groups.delete(id);
+    await Promise.all([...this.sessions.values()].filter(session =>
+      (session.profile?.id ?? session.configuration.profileId) === profileId).map(session => this.stop(session)));
   }
 
   async suspend(record) { this.suspended.add(record.id); await this.stop(record); }
@@ -274,7 +274,7 @@ export class ForwardManager extends EventEmitter {
 
   async startGroup(group) {
     if (this.groups.has(group.id)) return;
-    const operation = { forwardIds: [...group.forwardIds] };
+    const operation = { sourceId: group.sourceId ?? group.id, forwardIds: [...group.forwardIds] };
     this.groups.set(group.id, operation);
     try {
       for (const id of group.forwardIds) {
@@ -285,6 +285,10 @@ export class ForwardManager extends EventEmitter {
   }
 
   async stopGroup(group) { this.groups.delete(group.id); await Promise.all(group.forwardIds.map(id => this.stop({ id }))); }
+
+  cancelGroup(sourceId) {
+    for (const [id, operation] of this.groups) if (operation.sourceId === sourceId) this.groups.delete(id);
+  }
 
   async close() {
     this.closing = true;

@@ -147,7 +147,7 @@ export class KubeBackend {
     if (!fresh && cached && Date.now() - cached.at < 30000) return cached.value;
     const result = JSON.parse(await this.pool.run(['get', ...this.args(profile), '--request-timeout=20s', `--namespace=${target.namespace}`, `${target.kind}/${target.name}`, '--output=json'], { signal }));
     const value = target.kind === 'pod' ? podSummary(result) :
-      { ...target, ports: portsOf(result.spec.ports ?? []), selector: result.spec.selector ?? {} };
+      { ...target, status: result.spec.type, ports: portsOf(result.spec.ports ?? []), selector: result.spec.selector ?? {} };
     return this.remember(this.details, key, { ...value, detailsAt: Date.now() });
   }
 

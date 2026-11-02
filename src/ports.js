@@ -2,6 +2,15 @@ import { createServer, isIP } from 'node:net';
 import { readFile } from 'node:fs/promises';
 import { t } from './i18n/index.js';
 
+export function declaredForwardPorts(resource) {
+  const ports = new Map();
+  for (const port of resource?.ports ?? []) {
+    const target = resource.kind === 'service' && port.name ? port.name : String(port.port);
+    if (!ports.has(target)) ports.set(target, port);
+  }
+  return ports;
+}
+
 export async function privilegedPortThreshold() {
   const source = (await readFile('/proc/sys/net/ipv4/ip_unprivileged_port_start', 'utf8')).trim();
   if (!/^\d+$/.test(source) || Number(source) > 65535) throw new Error(t('error.portThreshold'));

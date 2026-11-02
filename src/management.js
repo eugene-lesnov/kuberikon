@@ -1,13 +1,15 @@
 import { ScrollBoxRenderable } from '@opentui/core';
 import { randomUUID } from 'node:crypto';
+import { execFile } from 'node:child_process';
+import { findExecutable } from './processes.js';
 import { join } from 'node:path';
 import { expandPath, discoverProfiles } from './kube.js';
 import { validateForward, validNamespace, isProfileFile, favoriteKey } from './config.js';
 import { LogExport } from './logs.js';
 import { commandKey } from './controls.js';
-import { oneLine, hostLabel, statusLabel } from './text.js';
+import { oneLine, statusLabel } from './text.js';
 import { t } from './i18n/index.js';
-import { suggestLocalPort } from './ports.js';
+import { declaredForwardPorts, suggestLocalPort } from './ports.js';
 import { Dialogs } from './dialogs.js';
 
 export class ManagementDialogs extends Dialogs {
@@ -99,7 +101,7 @@ export class ManagementDialogs extends Dialogs {
       const selected = this.profile?.id === profile.id;
       if (selected) this.switching = true;
       try {
-        if (selected) await this.forwards.stopAll();
+        await this.forwards.stopProfile(profile.id);
         await this.persist(data => { data.profiles = data.profiles.map(item => item.id === profile.id ? resolved : item); return data; });
         if (!this.closing && this.profile?.id === profile.id) {
           await this.closeLogs();
@@ -117,7 +119,7 @@ export class ManagementDialogs extends Dialogs {
       const selected = this.profile?.id === profile.id;
       if (selected) this.switching = true;
       try {
-        if (selected) await this.forwards.stopAll();
+        await this.forwards.stopProfile(profile.id);
         await this.persist(data => {
           data.profiles = data.profiles.filter(item => item.id !== profile.id);
           return data;
@@ -130,114 +132,175 @@ export class ManagementDialogs extends Dialogs {
     this.confirm(t('profile.delete'), t('profile.deleteText', { name: profile.name }), t('dialog.delete'), remove);
   }
 
-  async openForward(item = this.resourceTable.current(), selectedPort) {
-    if (!item || item.forwardIds) { this.setStatus(t('status.noResource')); return; }
+  async toggleForward(item = this.resourceTable.current()) {
+    if (!item || item.spec || item.forwardIds) return;
+    if (this.resourceTable.relatedForwards(item).length) {
+      return this.chooseResourceForward(record => this.controlCurrent(record), item, record => t(this.forwardAction(record)));
+    }
+    return this.openForward(item);
+  }
+
+  forwardAction(record) {
+    if (!record) return 'action.forwardPort';
+    if (record.status === 'stopping') return 'status.stopping';
+    if (record.want) return 'action.stopForward';
+    return record.status === 'error' ? 'action.retryForward' : 'action.startForward';
+  }
+
+  async openForward(item) {
     if (!this.profile) { this.openProfiles(); return; }
-    if (item.spec) { void this.perform(() => this.forwards.start(item)); return; }
     if (item.compact || item.favorite) {
+      const origin = this.modal;
       const controller = this.beginAction();
       const favorite = item.favorite;
       const profile = favorite ? await this.cluster.backend().resolveProfile({ ...this.profile }, controller.signal) : this.profile;
       item = await this.cluster.backend(profile).resource(profile, favorite ? favorite.target : item, controller.signal, { fresh: Boolean(favorite) });
-      if (controller.signal.aborted || this.closing) return;
+      if (controller.signal.aborted || this.closing || this.modal !== origin) return;
     }
-    if (item.ports.length > 1 && !selectedPort) {
-      this.pick(t('forward.choosePort'), item.ports.map(port => ({ name: `${port.name || port.port} · ${port.port}/TCP`, description: '', value: port })), port => this.openForward(item, port));
+    const ports = [...declaredForwardPorts(item).values()];
+    if (ports.length > 1) {
+      this.pick(t('forward.choosePort'), ports.map(port => ({ name: `${port.name ? port.name + ' · ' : ''}${port.port}/TCP`, value: port })),
+        port => this.forwardForm(item, { port }), `${item.namespace}/${item.kind}/${item.name}`);
       return;
     }
-    return this.forwardForm(item, selectedPort);
+    return this.forwardForm(item, { port: ports[0] });
   }
 
-  async forwardForm(item, selectedPort, record) {
-    const first = selectedPort ?? item.ports?.[0];
-    const spec = record?.spec ?? { ...item, localPort: first?.port ?? 28805, remotePort: item.kind === 'service' && first?.name ? first.name : first?.port ?? 28805, address: 'localhost' };
-    if (!record) {
-      const controller = this.beginAction();
-      spec.localPort = await suggestLocalPort(spec.localPort, spec.address, this.store.data.forwards, controller.signal);
-      if (controller.signal.aborted || this.closing) return;
+  sameForward(left, right) {
+    return ['kind', 'name', 'namespace', 'localPort', 'remotePort', 'address'].every(key => left[key] === right[key]);
+  }
+
+  forwardKey(spec) {
+    return JSON.stringify([spec.kind, spec.name, spec.namespace, spec.localPort, spec.remotePort, spec.address]);
+  }
+
+  templateGroup(group) {
+    const configurations = this.forwards.configurations;
+    const profileId = this.profile?.id;
+    if (this.templateIndex?.configurations !== configurations || this.templateIndex.profileId !== profileId) {
+      this.templateIndex = { configurations, profileId,
+        sources: new Map(configurations.map(record => [record.id, record])),
+        targets: new Map(configurations.filter(record => profileId && record.profileId === profileId)
+          .map(record => [this.forwardKey(record.spec), record.id])) };
     }
-    let values = { ...spec, start: !record, favorite: this.isFavorite(record ?? item) };
-    let favoriteTargetKey = favoriteKey(this.favoriteEntry(spec));
-    const syncFavorite = target => {
-      const key = favoriteKey(this.favoriteEntry(target));
-      if (key === favoriteTargetKey) return;
-      favoriteTargetKey = key;
-      values.favorite = this.isFavorite(target);
-    };
+    const { sources, targets } = this.templateIndex;
+    return { ...group, sourceId: group.id, id: JSON.stringify([group.id, profileId]), forwardIds: [...new Set(group.forwardIds.map(id => {
+      const source = sources.get(id);
+      return source && targets.get(this.forwardKey(source.spec));
+    }).filter(Boolean))] };
+  }
+
+  async startTemplate(group) {
+    if (!this.profile) { this.openProfiles(); return; }
+    const existing = this.templateGroup(group);
+    if (existing.forwardIds.length === group.forwardIds.length) return this.forwards.startGroup(existing);
+    const profileId = this.profile.id;
+    let resolved;
+    await this.persist(data => {
+      const byId = new Map(data.forwards.map(record => [record.id, record]));
+      const targets = new Map(data.forwards.filter(record => record.profileId === profileId)
+        .map(record => [this.forwardKey(record.spec), record]));
+      const sources = group.forwardIds.map(id => byId.get(id)).filter(Boolean);
+      const forwardIds = sources.map(source => {
+        const key = this.forwardKey(source.spec);
+        let record = targets.get(key);
+        if (!record) {
+          record = { id: randomUUID(), profileId, spec: { ...source.spec } };
+          data.forwards.push(record);
+          targets.set(key, record);
+        }
+        return record.id;
+      });
+      resolved = { ...group, sourceId: group.id, id: JSON.stringify([group.id, profileId]), forwardIds: [...new Set(forwardIds)] };
+      return data;
+    });
+    if (this.closing || this.profile?.id !== profileId) return;
+    return this.forwards.startGroup(resolved);
+  }
+
+  async forwardForm(item, { port, record, onReturn } = {}) {
+    const profile = record?.profileId ? this.profilesById.get(record.profileId) : this.profile;
+    if (!profile && !record) { this.openProfiles(); return; }
+    let values = { ...(record?.spec ?? { ...item, localPort: item.localPort ?? port?.port ?? 8080,
+      remotePort: item.remotePort ?? (item.kind === 'service' && port?.name ? port.name : port?.port ?? ''), address: 'localhost' }) };
+    if (!record) {
+      const origin = this.modal;
+      const controller = this.beginAction();
+      const reserved = this.forwards.records.filter(entry => this.forwards.isActive(entry) || entry.profileId === profile.id &&
+        entry.spec.kind === item.kind && entry.spec.namespace === item.namespace && entry.spec.name === item.name);
+      values.localPort = await suggestLocalPort(values.localPort, values.address, reserved, controller.signal);
+      if (controller.signal.aborted || this.closing || this.modal !== origin || this.profile?.id !== profile.id) return;
+    }
     const show = (advanced = false) => {
-      let favoriteAllowed = this.canToggleFavorite(values);
       const modal = this.form(t(record ? 'forward.edit' : 'forward.title'), [
         { key: 'localPort', label: t('forward.localPort'), value: values.localPort },
-        { key: 'remotePort', label: t('forward.remotePort'), value: values.remotePort },
-        ...(advanced ? [
-          { key: 'kind', label: t('forward.kind'), value: values.kind, options: [{ name: 'Service', value: 'service' }, { name: 'Pod', value: 'pod' }] },
-          { key: 'name', label: t('forward.resource'), value: values.name },
-          { key: 'namespace', label: t('namespace.name'), value: values.namespace },
-          { key: 'address', label: t('group.listenAddress'), value: values.address },
-        ] : []),
+        ...(!port || record || advanced ? [{ key: 'remotePort', label: t('forward.remotePort'), value: values.remotePort }] : []),
+        ...(advanced ? [{ key: 'address', label: t('group.listenAddress'), value: values.address }] : []),
       ], async fields => {
-        if (values.start && !this.profile) throw new Error(t('error.noProfile'));
-        const configuration = { id: record?.id ?? randomUUID(), spec: validateForward({ ...values, ...fields }) };
-        syncFavorite(configuration);
+        const configuration = { id: record?.id ?? randomUUID(), profileId: record ? record.profileId : profile.id,
+          spec: validateForward({ ...values, ...fields }) };
         const duplicate = this.store.data.forwards.find(entry => entry.id !== configuration.id &&
-          ['kind', 'name', 'namespace', 'localPort', 'remotePort', 'address'].every(key => entry.spec[key] === configuration.spec[key]));
-        if (duplicate) throw new Error(t('error.duplicateForward'));
-        await this.forwards.suspend(configuration);
+          entry.profileId === configuration.profileId && this.sameForward(entry.spec, configuration.spec));
+        if (duplicate && record) throw new Error(t('error.duplicateForward'));
+        const saved = duplicate ?? configuration;
+        if (record) await this.forwards.suspend(record);
         try {
           await this.persist(data => {
-            data.forwards = [...data.forwards.filter(entry => entry.id !== configuration.id), configuration];
-            const favorite = this.favoriteEntry(configuration);
-            const key = favoriteKey(favorite);
-            const isCurrent = entry => favoriteKey(entry) === key;
-            if (!values.favorite) data.favorites = data.favorites.filter(favorite => !isCurrent(favorite));
-            else if (favorite.target.kind === 'service' && !data.favorites.some(isCurrent)) data.favorites.push(favorite);
+            if (!duplicate) data.forwards = [...data.forwards.filter(entry => entry.id !== saved.id), saved];
             return data;
           });
-        } finally { this.forwards.resume(configuration); }
+        } finally { if (record) this.forwards.resume(record); }
         if (this.closing) return;
-        this.tab = 'forwards';
-        this.runningOnly = false;
-        this.filter.value = '';
-        this.queries.forwards = '';
-        this.selected.forwards = configuration.id;
-        this.resourceTable.renderTable();
-        this.updateHeader();
-        if (values.start) await this.forwards.start(configuration);
-        this.setStatus(t('forward.saved'));
-      }, { height: advanced ? 29 : 21,
-        description: `${oneLine(this.profile?.name ?? t('app.noProfile'))}\n${values.namespace}/${values.kind}/${values.name} · ${values.address}` });
+        if (this.modal === modal) this.closeModal();
+        if (!record) await this.forwards.start(saved);
+        onReturn?.(saved);
+        if (record) this.setStatus(t('forward.saved'));
+        else {
+          const result = this.forwards.records.find(entry => entry.id === saved.id);
+          if (result?.status === 'error') this.setStatus(result.info, true);
+        }
+      }, { height: advanced ? 23 : record || !port ? 20 : 16,
+        submitLabel: t(record ? 'dialog.save' : 'action.startForward'), onCancel: onReturn,
+        description: `${oneLine(profile?.name ?? t('forward.profileMissing'))}\n${values.namespace}/${values.kind}/${values.name}${values.remotePort ? ':' + values.remotePort : ''}` });
       const advancedButton = this.button(modal.scroll, t(advanced ? 'group.less' : 'group.advanced'), () => {
-        values = { ...values, ...Object.fromEntries([...modal.controls].map(([key, control]) =>
-          [key, key === 'kind' ? control.getSelectedOption().value : control.value.trim()])) };
+        if (modal.busy) return;
+        values = { ...values, ...Object.fromEntries([...modal.controls].map(([key, control]) => [key, control.value.trim()])) };
         show(!advanced);
       });
-      const startButton = this.button(modal.scroll, `${values.start ? '[x]' : '[ ]'} ${t('forward.startAfterSave')}`, () => {
-        values.start = !values.start;
-        startButton.actionActive = values.start;
-        this.setActionLabel(startButton, `${values.start ? '[x]' : '[ ]'} ${t('forward.startAfterSave')}`);
-      }, { active: values.start });
-      const favoriteLabel = () => `${values.favorite ? '[x]' : '[ ]'} ${t(favoriteAllowed ? 'forward.favorite' : 'forward.serviceOnly')}`;
-      const favoriteButton = this.button(modal.scroll, favoriteLabel(), () => {
-        values.favorite = !values.favorite;
-        favoriteButton.actionActive = values.favorite;
-        this.setActionLabel(favoriteButton, favoriteLabel());
-      }, { active: values.favorite, enabled: () => favoriteAllowed });
-      const updateFavorite = () => {
-        const target = { ...values };
-        for (const key of ['kind', 'name', 'namespace']) {
-          const control = modal.controls.get(key);
-          if (control) target[key] = key === 'kind' ? control.getSelectedOption().value : control.value.trim();
-        }
-        syncFavorite(target);
-        favoriteAllowed = this.canToggleFavorite(target);
-        favoriteButton.actionActive = values.favorite;
-        this.setActionLabel(favoriteButton, favoriteLabel());
-      };
-      for (const key of ['kind', 'name', 'namespace']) modal.controls.get(key)?.on(key === 'kind' ? 'selectionChanged' : 'input', updateFavorite);
-      for (const control of [advancedButton, startButton, favoriteButton]) modal.rows.set(control, control);
-      modal.focusables.splice(modal.focusables.length - 2, 0, advancedButton, startButton, favoriteButton);
+      modal.rows.set(advancedButton, advancedButton);
+      modal.focusables.splice(modal.focusables.length - 2, 0, advancedButton);
+      if (!record && !advanced && port) this.navigation.focus(modal.focusables.at(-1));
+      else if (!values.remotePort) this.navigation.focus(modal.controls.get('remotePort'));
     };
     show();
+  }
+
+  forwardAddress(record) {
+    const address = ['localhost', '0.0.0.0', '::'].includes(record.spec.address) ? 'localhost' : record.spec.address;
+    return `${address.includes(':') ? '[' + address + ']' : address}:${record.spec.localPort}`;
+  }
+
+  async copyForward(record = this.resourceTable.current()) {
+    if (!record?.spec) return;
+    const result = await this.clipboard.writeText(this.forwardAddress(record), { destination: 'best-available' });
+    if (!this.closing) this.setStatus(t(result.host.status === 'written' ? 'status.addressCopied' :
+      result.terminal.status === 'attempted' ? 'status.copyAttempted' : 'status.copyUnsupported'));
+  }
+
+  openForwardBrowser(record = this.resourceTable.current(), onReturn) {
+    if (record?.status !== 'running') return;
+    this.pick(t('forward.browser'), ['http', 'https'].map(protocol => ({
+      name: `${protocol}://${this.forwardAddress(record)}`, description: '', value: protocol,
+    })), async protocol => {
+      onReturn?.();
+      if (this.forwards.records.find(entry => entry.id === record.id)?.status !== 'running') return;
+      const url = `${protocol}://${this.forwardAddress(record)}`;
+      await new Promise((resolve, reject) => {
+        execFile(findExecutable('xdg-open'), [url], { timeout: 10000, maxBuffer: 65536 }, error => error ? reject(error) : resolve());
+      });
+      if (!this.closing) this.setStatus(t('forward.browserOpened'));
+    });
+    this.modal.cancel = onReturn;
   }
 
   deleteForward(record) {
@@ -286,50 +349,38 @@ export class ManagementDialogs extends Dialogs {
     });
   }
 
-  async chooseResourceForward(onChoose, item = this.resourceTable.current()) {
-    if (!item || item.spec || item.forwardIds) return;
-    let records = this.resourceTable.relatedForwards(item);
-    if (item.kind === 'pod' && !item.favorite && this.profile &&
-      this.forwards.records.some(record => record.spec.kind === 'service' && record.spec.namespace === item.namespace)) {
-      const controller = this.beginAction();
-      try {
-        const services = await this.cluster.backend().servicesFor(this.profile, item, controller.signal);
-        const names = new Set(services.map(service => service.name));
-        records = this.forwards.records.filter(record => record.spec.namespace === item.namespace &&
-          (record.spec.kind === 'pod' && record.spec.name === item.name || record.spec.kind === 'service' && names.has(record.spec.name)));
-      } catch (error) { if (error.name === 'AbortError' || !records.length) throw error; }
-      if (controller.signal.aborted || this.closing) return;
-    }
-    if (!records.length) { this.setStatus(t('favorite.noForwards')); return; }
+  chooseResourceForward(onChoose, item, label) {
+    const records = this.resourceTable.relatedForwards(item);
+    if (!records.length) return;
     if (records.length === 1) return onChoose(records[0]);
     this.pick(t('favorite.chooseForward'), records.map(record => ({
-      name: `${hostLabel(record.spec.address)}:${record.spec.localPort} → ${record.spec.remotePort}`,
-      description: statusLabel(record.status), value: record.id,
-    })), id => {
-      const record = this.forwards.records.find(record => record.id === id);
-      if (record) return onChoose(record);
-    });
+      name: `${record.spec.remotePort} → ${this.forwardAddress(record)}`,
+      description: [statusLabel(record.status), label?.(record)].filter(Boolean).join(' · '), value: record,
+    })), onChoose, `${item.namespace}/${item.kind}/${item.name}`);
   }
 
-  async moveFavorite(direction, item = this.resourceTable.current()) {
-    if (this.tab !== 'favorites' || !item?.favorite) return;
-    const key = favoriteKey(item.favorite);
+  async moveSavedItem(direction, item = this.resourceTable.current()) {
+    const tab = this.tab;
+    if (!['favorites', 'groups'].includes(tab) || !item) return;
+    const key = this.resourceTable.rowId(item);
+    const entryKey = tab === 'favorites' ? favoriteKey : entry => entry.id;
     const index = this.visibleRows.findIndex(row => this.resourceTable.rowId(row) === key);
     if (index < 0 || !this.visibleRows[index + direction]) return;
     const visibleIds = new Set(this.visibleRows.map(row => this.resourceTable.rowId(row)));
     await this.persist(data => {
-      const keys = data.favorites.map(favoriteKey);
+      const entries = data[tab];
+      const keys = entries.map(entryKey);
       const visible = keys.filter(id => visibleIds.has(id));
       const position = visible.indexOf(key);
       const neighborId = visible[position + direction];
       if (position < 0 || !neighborId) return data;
       const from = keys.indexOf(key);
       const to = keys.indexOf(neighborId);
-      const [favorite] = data.favorites.splice(from, 1);
-      data.favorites.splice(to, 0, favorite);
+      const [entry] = entries.splice(from, 1);
+      entries.splice(to, 0, entry);
       return data;
     });
-    if (this.tab === 'favorites' && !this.logs && !this.closing && this.selected.favorites === key) {
+    if (this.tab === tab && !this.logs && !this.closing && this.selected[tab] === key) {
       this.resourceTable.selectRow(this.visibleRows.findIndex(row => this.resourceTable.rowId(row) === key));
     }
   }
@@ -365,12 +416,14 @@ export class ManagementDialogs extends Dialogs {
     const addMember = () => {
       if (modal.busy) return;
       draft.name = name.value;
+      state.selectedForwardId = select.getSelectedOption()?.value;
       this.addGroupForward(state, record => {
         if (record && !draft.forwardIds.includes(record.id)) {
           draft.forwardIds.push(record.id);
           if (!this.store.data.forwards.some(item => item.id === record.id)) state.pending.push(record);
         }
-        this.editGroup(group, undefined, state);
+        if (record) state.selectedForwardId = record.id;
+        this.editGroup(group, undefined, { ...state, focusForwards: true });
       });
     };
     const add = this.button(actions, t('group.addForward'), addMember, { shortcut: 'a' });
@@ -382,9 +435,9 @@ export class ManagementDialogs extends Dialogs {
       refresh();
       if (!select.visible) add.focus();
     };
-    const remove = this.button(actions, t('group.remove'), removeMember, { shortcut: 'd' });
+    const remove = this.button(actions, t('group.remove'), removeMember, { shortcut: 'r' });
     const refresh = () => {
-      const selectedId = select.getSelectedOption()?.value;
+      const selectedId = select.getSelectedOption()?.value ?? state.selectedForwardId;
       const entries = members();
       select.options = entries.map(record => ({ name: `${oneLine(record.spec.name)}   ${record.spec.localPort} → ${record.spec.remotePort}`,
         description: `${record.spec.namespace} · ${record.spec.kind}`, value: record.id }));
@@ -414,15 +467,18 @@ export class ManagementDialogs extends Dialogs {
           const memberIds = new Set(draft.forwardIds);
           for (const record of state.pending.filter(item => memberIds.has(item.id))) {
             const existing = data.forwards.find(item =>
-              ['kind', 'name', 'namespace', 'localPort', 'remotePort', 'address'].every(key => item.spec[key] === record.spec[key]));
+              item.profileId === record.profileId && this.sameForward(item.spec, record.spec));
             ids.set(record.id, existing?.id ?? record.id);
             if (!existing) data.forwards.push(record);
           }
           const saved = { id: draft.id, name: groupName, autostart: draft.autostart,
             forwardIds: [...new Set(draft.forwardIds.map(id => ids.get(id) ?? id))] };
-          return { ...data, groups: [...data.groups.filter(item => item.id !== draft.id), saved] };
+          const index = data.groups.findIndex(item => item.id === draft.id);
+          if (index < 0) data.groups.push(saved);
+          else data.groups[index] = saved;
+          return data;
         });
-        this.forwards.groups.delete(draft.id);
+        this.forwards.cancelGroup(draft.id);
         if (this.closing || this.modal !== modal) return;
         this.closeModal();
         this.tab = 'groups'; this.filter.value = ''; this.queries.groups = ''; this.selected.groups = draft.id;
@@ -443,14 +499,14 @@ export class ManagementDialogs extends Dialogs {
         void this.perform(addMember);
         return true;
       }
-      if (this.renderer.currentFocusedRenderable === select && (shortcut === 'd' || ['delete', 'backspace'].includes(key.name))) {
+      if (this.renderer.currentFocusedRenderable === select && (shortcut === 'r' || ['delete', 'backspace'].includes(key.name))) {
         removeMember();
         return true;
       }
       return false;
     };
     refresh();
-    if (!group) name.focus();
+    if (!group && !state.focusForwards) name.focus();
     else if (select.visible) select.focus();
     else add.focus();
   }
@@ -540,10 +596,7 @@ export class ManagementDialogs extends Dialogs {
           request = this.beginAction();
           if (item.compact) item = await this.cluster.backend(profile).resource(profile, item, request.signal);
           if (request.signal.aborted || this.modal !== modal || this.closing) return;
-          const preferred = item.ports[0]?.port ?? 8080;
-          const localPort = await suggestLocalPort(preferred, 'localhost', [...this.store.data.forwards, ...state.pending], request.signal);
-          if (request.signal.aborted || this.modal !== modal || this.closing) return;
-          this.configureGroupForward(item, profile, localPort, state, onReturn, browse);
+          this.configureGroupForward(item, profile, state, onReturn, browse);
         } catch (failure) { if (this.modal === modal && !this.closing) error.content = oneLine(failure.message); }
         finally { modal.busy = false; this.refreshButtons(); }
       };
@@ -578,10 +631,11 @@ export class ManagementDialogs extends Dialogs {
     browse();
   }
 
-  configureGroupForward(item, profile, localPort, state, onAdd, onBack) {
+  configureGroupForward(item, profile, state, onAdd, onBack) {
     const portOptions = item.ports.map(port => ({ name: `${port.name || port.port} · ${port.port}/TCP`,
       value: item.kind === 'service' && port.name ? port.name : String(port.port) }));
-    let values = { localPort, remotePort: portOptions[0]?.value ?? '8080', address: 'localhost' };
+    let suggestedLocalPort = item.ports[0]?.port ?? 8080;
+    let values = { localPort: suggestedLocalPort, remotePort: portOptions[0]?.value ?? '8080', address: 'localhost' };
     const show = (advanced = false) => {
       const modal = this.form(t('group.configureForward'), [
         { key: 'remotePort', label: t('forward.remotePort'), value: values.remotePort, ...(portOptions.length ? { options: portOptions } : {}) },
@@ -592,11 +646,18 @@ export class ManagementDialogs extends Dialogs {
       ], fields => {
         const spec = validateForward({ ...values, ...fields, kind: item.kind, namespace: item.namespace, name: item.name });
         const existing = [...this.store.data.forwards, ...state.pending].find(record =>
-          ['kind', 'name', 'namespace', 'localPort', 'remotePort', 'address'].every(key => record.spec[key] === spec[key]));
-        onAdd(existing ?? { id: randomUUID(), spec });
+          !record.profileId && this.sameForward(record.spec, spec));
+        onAdd(existing ?? { id: randomUUID(), profileId: null, spec });
       }, { onCancel: onBack, submitLabel: t('group.add'), cancelLabel: t('group.back'),
         height: advanced ? 23 : 20,
         description: `${oneLine(profile.name)} · ${oneLine(profile.context)}\n${item.namespace}/${item.kind}/${item.name}` });
+      if (portOptions.length) modal.controls.get('remotePort').on('selectionChanged', () => {
+        const selected = modal.controls.get('remotePort').getSelectedIndex();
+        const port = item.ports[selected].port;
+        const local = modal.controls.get('localPort');
+        if (local.value === String(suggestedLocalPort)) local.value = String(port);
+        suggestedLocalPort = port;
+      });
       const advancedButton = this.button(modal.scroll, t(advanced ? 'group.less' : 'group.advanced'), () => {
         if (modal.busy) return;
         values = { ...values, ...Object.fromEntries([...modal.controls].map(([key, control]) => {
@@ -613,7 +674,7 @@ export class ManagementDialogs extends Dialogs {
 
   deleteGroup(group) {
     this.confirm(t('group.delete'), t('group.deleteText', { name: group.name }), t('dialog.delete'), async () => {
-      this.forwards.groups.delete(group.id);
+      this.forwards.cancelGroup(group.id);
       await this.persist(data => { data.groups = data.groups.filter(item => item.id !== group.id); return data; });
     });
   }
@@ -689,7 +750,8 @@ export class ManagementDialogs extends Dialogs {
     const services = await this.cluster.backend().servicesFor(this.profile, item, controller.signal);
     if (controller.signal.aborted || this.closing) return;
     if (!services.length) throw new Error(t('error.noService'));
-    this.pick(t('forward.chooseService'), services.map(service => ({ name: service.name, description: service.ports.map(port => port.port).join(', '), value: service })), service => this.openForward(service));
+    if (services.length === 1) return this.resourceTable.showDetails(services[0]);
+    this.pick(t('forward.chooseService'), services.map(service => ({ name: service.name, description: service.ports.map(port => port.port).join(', '), value: service })), service => this.resourceTable.showDetails(service));
   }
 
   editExportDirectory() {

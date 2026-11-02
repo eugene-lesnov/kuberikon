@@ -59,8 +59,8 @@ export class Widgets {
       justifyContent: footer ? 'flex-end' : 'flex-start', marginTop: footer ? 1 : 0, ...options });
   }
 
-  button(parent, label, action, { shortcut = '', primary = false, active = false,
-    backgroundColor = this.colors.panel, enabled, allowWhileBusy = false, skipWhenDisabled = false, width } = {}) {
+  button(parent, label, action, { shortcut = '', showShortcut = false, primary = false, active = false,
+    backgroundColor = this.colors.panel, enabled, allowWhileBusy = false, skipWhenDisabled = false } = {}) {
     let owner = parent;
     while (owner && owner !== this.modal?.dialog) owner = owner.parent;
     const modal = owner ? this.modal : null;
@@ -91,7 +91,7 @@ export class Widgets {
         if (['return', 'space'].includes(key.name)) { key.preventDefault(); key.stopPropagation(); activate(); }
       } });
     this.text(button, '', { width: '100%', height: 1, truncate: true, wrapMode: 'none' });
-    Object.assign(button, { shortcut, primary, actionActive: active, surface: backgroundColor, canActivate, skipWhenDisabled, fixedWidth: width });
+    Object.assign(button, { shortcut, showShortcut, primary, actionActive: active, surface: backgroundColor, canActivate, skipWhenDisabled });
     this.setActionLabel(button, label);
     button.on('focused', () => this.paintButton(button));
     button.on('blurred', () => this.paintButton(button));
@@ -106,10 +106,10 @@ export class Widgets {
     if (button.buttonLabel === value) { this.paintButton(button); return; }
     button.buttonLabel = value;
     const key = button.shortcut;
-    const index = /^[a-z]$/i.test(key) ? button.buttonLabel.toLowerCase().indexOf(key.toLowerCase()) : -1;
+    const index = !button.showShortcut && /^[a-z]$/i.test(key) ? button.buttonLabel.toLowerCase().indexOf(key.toLowerCase()) : -1;
     button.labelIndex = index;
     button.labelPrefix = key && index < 0 ? `${key} ` : '';
-    button.width = button.fixedWidth ?? stringWidth(button.labelPrefix + button.buttonLabel) + 2;
+    button.width = stringWidth(button.labelPrefix + button.buttonLabel) + 2;
     button.buttonState = null;
     this.paintButton(button);
   }

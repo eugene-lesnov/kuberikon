@@ -43,7 +43,8 @@
     "package": "npm run build && node scripts/package.js",
     "release:npm": "node scripts/publish.js",
     "prepare": "npm run build",
-    "check": "node scripts/check.js"
+    "check": "node scripts/check.js",
+    "test": "node --experimental-ffi --test --test-isolation=none tests/*.test.js"
   },
   "devDependencies": {
     "@opentui/core": "0.8.0",

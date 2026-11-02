@@ -57,7 +57,7 @@ export function showLogDetails(app) {
       showRecord(recordIndex + (key.sequence === '<' ? -1 : 1));
       return true;
     }
-    if (!modified && !key.shift && focused === search && ['up', 'down'].includes(key.name)) {
+    if (key.ctrl && !key.meta && !key.option && !key.shift && focused === search && ['up', 'down'].includes(key.name)) {
       text.findMatch(key.name === 'up' ? -1 : 1);
       return true;
     }

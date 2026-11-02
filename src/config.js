@@ -20,13 +20,13 @@ export function validateForward(spec) {
   return { kind: spec.kind, name: spec.name, namespace: spec.namespace, localPort: Number(spec.localPort), remotePort: remote, address: spec.address };
 }
 
-export const emptySettings = () => ({ version: 5, profilesDirectory: '', logExportDirectory: '', profiles: [], forwards: [], favorites: [], groups: [] });
+export const emptySettings = () => ({ version: 6, profilesDirectory: '', logExportDirectory: '', profiles: [], forwards: [], favorites: [], groups: [] });
 
 export const favoriteKey = favorite => JSON.stringify(['resource', favorite.target.namespace, favorite.target.kind, favorite.target.name]);
 
 export function validateSettings(value) {
   const invalid = () => { throw new Error(t('error.settingsSchema')); };
-  if (!value || ![3, 4, 5].includes(value.version) || !['profiles', 'forwards', 'groups'].every(key => Array.isArray(value[key]) && value[key].length <= 10000)) invalid();
+  if (!value || value.version !== 6 || !['profiles', 'forwards', 'groups', 'favorites'].every(key => Array.isArray(value[key]) && value[key].length <= 10000)) invalid();
   const profilesDirectory = value.profilesDirectory ?? '';
   const logExportDirectory = value.logExportDirectory ?? '';
   if ([profilesDirectory, logExportDirectory].some(path => path !== '' && (!text(path) || !isAbsolute(path)))) invalid();
@@ -39,27 +39,16 @@ export function validateSettings(value) {
   });
   const forwards = value.forwards.map(forward => {
     id(forward);
-    return { id: forward.id, spec: validateForward(forward.spec ?? {}) };
+    const profileId = forward.profileId;
+    if (profileId !== null && !text(profileId)) invalid();
+    return { id: forward.id, profileId, spec: validateForward(forward.spec ?? {}) };
   });
   const forwardIds = new Set(forwards.map(forward => forward.id));
-  let rawFavorites = value.favorites;
-  if (value.version === 3) {
-    const legacyIds = value.favoriteForwardIds === undefined ? [] : value.favoriteForwardIds;
-    if (!Array.isArray(legacyIds) || legacyIds.length > 10000) invalid();
-    rawFavorites = legacyIds.map(forwardId => ({ type: 'forward', forwardId }));
-  }
-  if (!Array.isArray(rawFavorites) || rawFavorites.length > 10000) invalid();
-  const forwardsById = new Map(forwards.map(forward => [forward.id, forward]));
   const favoriteKeys = new Set();
-  const favorites = rawFavorites.map(favorite => {
-    let target;
-    if (favorite?.type === 'forward') {
-      target = forwardsById.get(favorite.forwardId)?.spec;
-      if (!target) invalid();
-    } else if (favorite?.type === 'resource') {
-      target = favorite.target;
-      if (!target || !['service', 'pod'].includes(target.kind) || !validResourceName(target.name) || !validNamespace(target.namespace)) invalid();
-    } else invalid();
+  const favorites = value.favorites.map(favorite => {
+    if (favorite?.type !== 'resource') invalid();
+    const target = favorite.target;
+    if (!target || !['service', 'pod'].includes(target.kind) || !validResourceName(target.name) || !validNamespace(target.namespace)) invalid();
     const normalized = { type: 'resource', target: { kind: target.kind, name: target.name, namespace: target.namespace } };
     const key = favoriteKey(normalized);
     if (favoriteKeys.has(key)) return null;
@@ -72,5 +61,5 @@ export function validateSettings(value) {
     return { id: group.id, name: group.name, forwardIds: [...group.forwardIds], autostart: group.autostart };
   });
   if (new Set(groups.map(group => group.name.toLowerCase())).size !== groups.length) invalid();
-  return { version: 5, profilesDirectory, logExportDirectory, profiles, forwards, favorites, groups };
+  return { version: 6, profilesDirectory, logExportDirectory, profiles, forwards, favorites, groups };
 }

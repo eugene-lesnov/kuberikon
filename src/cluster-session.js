@@ -123,17 +123,16 @@ export class ClusterSession {
     this.podDetailTarget = null;
   }
 
-  schedulePodDetails(item, inDialog = false) {
+  schedulePodDetails(item) {
     const app = this.app;
     if (!item?.compact || !app.profile || app.logs || app.small || app.closing ||
-      (app.modal ? !inDialog : !app.sidebar.visible)) { this.cancelPodDetails(); return; }
+      app.modal || !app.sidebar.visible) { this.cancelPodDetails(); return; }
     const profile = { ...app.profile };
     const backend = this.backend(profile);
     const key = backend.resourceKey(profile, item);
     if (this.podDetailTarget !== key) this.cancelPodDetails();
     this.podDetailTarget = key;
-    if (this.podDetailRequest || this.podDetailTimer || app.podDetail?.key === key && Date.now() - app.podDetail.at < 30000 &&
-      (app.podDetail.error || app.podDetail.services)) return;
+    if (this.podDetailRequest || this.podDetailTimer || app.podDetail?.key === key && Date.now() - app.podDetail.at < 30000) return;
     this.podDetailTimer = setTimeout(async () => {
       this.podDetailTimer = null;
       const controller = new AbortController();
@@ -142,14 +141,6 @@ export class ClusterSession {
         const value = await backend.resource(profile, item, controller.signal);
         if (!controller.signal.aborted && !app.closing && this.podDetailTarget === key) {
           app.podDetail = { key, value, at: value.detailsAt };
-          app.resourceTable.updateDetails();
-          let services = [];
-          try {
-            if (app.store.data.forwards.some(record => record.spec.kind === 'service' && record.spec.namespace === item.namespace)) {
-              services = await backend.servicesFor(profile, value, controller.signal);
-            }
-          } catch (error) { if (error.name === 'AbortError') return; }
-          if (!controller.signal.aborted && !app.closing && this.podDetailTarget === key) app.podDetail = { key, value, services, at: value.detailsAt };
         }
       } catch (error) {
         if (error.name !== 'AbortError' && !app.closing && this.podDetailTarget === key) {
@@ -159,10 +150,9 @@ export class ClusterSession {
         if (this.podDetailRequest?.controller === controller) {
           this.podDetailRequest = null;
           app.resourceTable.updateDetails();
-          if (!app.renderer.hasSelection) app.modal?.refresh?.();
         }
       }
-    }, inDialog ? 0 : 200);
+    }, 200);
   }
 
   async connect(candidate, initial = false) {
@@ -191,7 +181,7 @@ export class ClusterSession {
         this.loadState = null;
         this.generation++;
         await app.closeLogs();
-        if (changingProfile) await app.forwards.stopAll();
+        if (changingProfile && app.profile.id === resolved.id) await app.forwards.stopProfile(resolved.id);
         if (controller.signal.aborted || app.closing) return;
         app.profile = resolved;
         app.resourceTable.relatedIndex = null;
@@ -212,9 +202,7 @@ export class ClusterSession {
         await app.startAutomaticGroups();
       }
     };
-    const active = app.forwards.records.filter(record => app.forwards.isActive(record)).length;
-    if (active && ['id', 'file', 'context'].some(key => resolved[key] !== app.profile?.[key])) app.confirm(t('profile.switchTitle'), t('profile.switchText', { name: resolved.name, count: active }), t('profile.switch'), activate);
-    else await activate();
+    await activate();
   }
 
   async disconnectProfile() {
@@ -225,12 +213,11 @@ export class ClusterSession {
     this.loadState = null;
     this.generation++;
     await app.closeLogs();
-    await app.forwards.stopAll();
     app.profile = null;
     app.resourceTable.relatedIndex = null;
     app.namespace = app.options.namespace ?? 'default';
     app.rows = [];
-    app.tab = 'favorites';
+    app.tab = 'services';
     app.filter.value = '';
     await app.store.saveState({ lastProfileId: undefined });
     app.resourceTable.renderTable();

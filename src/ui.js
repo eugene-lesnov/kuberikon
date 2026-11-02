@@ -24,10 +24,10 @@ const themes = {
   dark: { background: '#10151d', panel: '#151d28', input: '#202c3b', text: '#d9e2ef', muted: '#94a3b8', line: '#364152', accent: '#7cb8ff', selected: '#244369', error: '#ff919a', warn: '#d6a08a', good: '#8cd9b1', mark: '#49352e' },
   light: { background: '#f4f6f9', panel: '#ffffff', input: '#e8edf4', text: '#182335', muted: '#52647b', line: '#b7c4d4', accent: '#1755a0', selected: '#cfe2fa', error: '#a51e36', warn: '#805600', good: '#176b45', mark: '#ffdf8a' },
 };
-const tabs = ['favorites', 'forwards', 'groups', 'cluster'];
+const tabs = ['cluster', 'favorites', 'forwards', 'groups'];
 const clusterTabs = ['services', 'pods'];
 
-class KuberikonApp extends ManagementDialogs {
+export class KuberikonApp extends ManagementDialogs {
   constructor(renderer, options, version, store) {
     super();
     this.store = store;
@@ -42,12 +42,13 @@ class KuberikonApp extends ManagementDialogs {
     this.pool = new ProcessPool();
     this.privileged = new PrivilegedPorts((port, signal) => this.authorizePort(port, signal));
     this.live = new KubeBackend(this.pool, this.privileged);
-    this.forwards = new ForwardManager({ profile: () => this.profile,
+    this.forwards = new ForwardManager({ profile: configuration => this.profilesById.get(configuration.profileId),
       resolveProfile: (profile, signal) => this.cluster.backend(profile).resolveProfile(profile, signal), backend: profile => this.cluster.backend(profile) });
     this.clipboard = createClipboard({ host: createHostClipboard(), terminal: createRendererClipboardAdapter(renderer) });
     this.profile = null;
     this.namespace = options.namespace ?? 'default';
-    this.tab = 'favorites';
+    this.tab = 'services';
+    this.runningOnly = false;
     this.clusterTab = 'services';
     this.queries = { favorites: '', forwards: '', services: '', pods: '', groups: '' };
     this.selected = {};
@@ -56,6 +57,7 @@ class KuberikonApp extends ManagementDialogs {
     this.rowViews = [];
     this.discovered = [];
     this.profiles = [...store.data.profiles];
+    this.profilesById = new Map(this.profiles.map(profile => [profile.id, profile]));
     this.forwards.replace(store.data.forwards);
     this.logGeneration = 0;
     this.navigation = new KeyboardNavigation(this);
@@ -85,13 +87,13 @@ class KuberikonApp extends ManagementDialogs {
     this.profileText = this.text(header, '', { flexGrow: 1, flexShrink: 1, minWidth: 1, wrapMode: 'none', truncate: true });
     this.modeText = this.text(header, '', { width: 'auto', flexShrink: 0, textAlign: 'right', fg: color.accent });
     this.tabBar = this.box(this.root, { height: 1, flexShrink: 0, flexDirection: 'row', paddingX: 1, gap: 1 });
-    this.tabBoxes = tabs.map(tab => this.action(this.tabBar, t(`tab.${tab}`), () => this.switchTab(tab), { width: 17 }));
+    this.tabBoxes = tabs.map(tab => this.action(this.tabBar, t(`tab.${tab}`), () => this.switchTab(tab)));
     this.directoryBanner = this.box(this.root, { height: 3, flexShrink: 0, marginX: 1, border: true,
       borderColor: color.line, flexDirection: 'row', alignItems: 'center', paddingX: 1 });
     this.directoryMessage = this.text(this.directoryBanner, t('profile.directoryBanner'), { flexGrow: 1, wrapMode: 'word', fg: color.muted });
     this.directoryButton = this.action(this.directoryBanner, t('settings.setFolder'), () => this.editProfilesDirectory());
     this.filterRow = this.box(this.root, { height: 2, flexShrink: 0, paddingX: 1, flexDirection: 'row', alignItems: 'center', gap: 1 });
-    this.resourceButtons = clusterTabs.map(tab => this.action(this.filterRow, t(`view.${tab}`), () => this.switchTab(tab)));
+    this.resourceButtons = clusterTabs.map(tab => this.action(this.filterRow, t(`view.${tab}`), () => this.switchTab(tab), { shortcut: tab[0], showShortcut: true }));
     this.resourceButtons.forEach(button => { button.visible = false; });
     this.filter = this.input({ width: 'auto', flexGrow: 1, flexShrink: 1, minWidth: 1, value: '', placeholder: t('list.filter'), maxLength: 160 });
     this.filterRow.add(this.filter);
@@ -120,7 +122,7 @@ class KuberikonApp extends ManagementDialogs {
     });
     this.table.on('focused', () => { this.listPanel.borderColor = color.accent; this.resourceTable.paintSelection(); });
     this.table.on('blurred', () => { this.listPanel.borderColor = color.line; this.resourceTable.paintSelection(); });
-    this.sidebar = new ScrollBoxRenderable(this.renderer, { width: 40, flexShrink: 0, border: true, focusable: false,
+    this.sidebar = new ScrollBoxRenderable(this.renderer, { width: 40, flexShrink: 0, border: true, focusable: true,
       borderColor: color.line, focusedBorderColor: color.accent, title: t('details.title'), titleColor: color.muted, paddingX: 1, scrollX: false });
     this.body.add(this.sidebar);
     this.detailText = this.text(this.sidebar, '', { width: '100%', wrapMode: 'word', selectable: true, flexShrink: 0 });
@@ -244,6 +246,7 @@ class KuberikonApp extends ManagementDialogs {
   syncStore() {
     this.profiles = [...this.store.data.profiles,
       ...this.discovered.filter(candidate => !this.store.data.profiles.some(profile => profile.file === candidate.file))];
+    this.profilesById = new Map(this.profiles.map(profile => [profile.id, profile]));
     this.forwards.replace(this.store.data.forwards);
   }
 
@@ -288,7 +291,7 @@ class KuberikonApp extends ManagementDialogs {
     const profileId = this.profile.id;
     for (const group of this.store.data.groups.filter(item => item.autostart)) {
       if (this.closing || this.switching || this.profile?.id !== profileId) return;
-      await this.forwards.startGroup(group);
+      await this.startTemplate(group);
     }
   }
 
@@ -313,11 +316,13 @@ class KuberikonApp extends ManagementDialogs {
 
   updateHeader() {
     if (this.closing) return;
-    const active = this.forwards.records.filter(record => record.status === 'running').length;
     const shownProfile = this.logs?.profile ?? this.profile;
-    const shownNamespace = this.logs?.sources[0]?.pod.namespace ?? this.namespace;
-    const namespaceLabel = this.logs || this.tab !== 'favorites' ? `   ${t('app.namespace', { name: oneLine(shownNamespace) })}` : '';
-    this.profileText.content = `${t('app.profile', { name: oneLine(shownProfile?.name ?? t('app.noProfile')) })}${namespaceLabel}   ${t('app.count', { count: active })}`;
+    const allProfiles = !this.logs && this.tab === 'forwards';
+    const active = this.forwards.records.filter(record => record.status === 'running' && (allProfiles || record.profileId === shownProfile?.id)).length;
+    const scope = allProfiles ? t('app.allProfiles') : t('app.profile', { name: oneLine(shownProfile?.name ?? t('app.noProfile')) });
+    const namespace = this.logs?.sources[0]?.pod.namespace ?? this.namespace;
+    const namespaceLabel = this.logs || clusterTabs.includes(this.tab) ? `   ${t('app.namespace', { name: oneLine(namespace) })}` : '';
+    this.profileText.content = `${scope}${namespaceLabel}   ${t('app.count', { count: active })}`;
     const readOnly = this.store.readOnly || this.store.damaged;
     const feedback = this.cluster.feedback();
     this.modeText.content = `kuberikon · ${this.version.split('-')[0]}${readOnly ? t('app.readOnlyBadge') : ''}`;
@@ -352,47 +357,33 @@ class KuberikonApp extends ManagementDialogs {
     this.updateActions();
   }
 
-  action(parent, label, action, { allowWhileSwitching = false, ...options } = {}) {
+  action(parent, label, action, { allowWhileSwitching = false, enabled, ...options } = {}) {
     return this.button(parent, label, action, { backgroundColor: this.colors.background,
-      enabled: () => !this.modal && (!this.switching || allowWhileSwitching), ...options });
+      enabled: () => !this.modal && (!this.switching || allowWhileSwitching) && (!enabled || enabled()), ...options });
   }
 
   updateActions() {
     const mode = this.logs ? 'logs' : this.tab;
+    const commands = this.commands.viewActions();
     if (this.actionMode !== mode) {
       this.actionMode = mode;
       this.clear(this.actions);
       this.clear(this.keys);
-      this.actionButtons = this.commands.viewActions().map(({ shortcut, message, run }) =>
-        this.action(this.actions, t(message), run, { shortcut }));
+      this.actionButtons = commands.map(({ shortcut, message, run, when }) =>
+        this.action(this.actions, t(message), run, { shortcut, enabled: when }));
       this.keyButtons = this.commands.commonActions().map(({ shortcut, message, run }) =>
         this.action(this.keys, t(message), run, { shortcut, allowWhileSwitching: shortcut === 'F10' }));
     }
-    if (this.logs) this.setActionLabel(this.actionButtons[0], t(this.logViewport.following ? 'action.pause' : 'action.follow'));
-    const current = this.resourceTable.current();
-    const active = ['forwards', 'groups'].includes(mode) && this.forwards.isActive(current);
-    const favorite = this.isFavorite(current);
-    const pinViews = ['favorites', 'forwards', 'services', 'pods'];
-    for (const button of this.actionButtons) {
-      if (mode === 'logs' && button.shortcut === 'v') {
-        this.setActionLabel(button, t(this.logViewport.wrap ? 'action.wrapOn' : 'action.wrapOff'));
+    this.actionButtons.forEach((button, index) => {
+      const command = commands[index];
+      const visible = !command.when || command.when();
+      if (!visible && button.focused) this.table.focus();
+      button.visible = visible;
+      if (visible) {
+        button.actionActive = command.active?.() ?? false;
+        this.setActionLabel(button, t(command.message));
       }
-      if (button.shortcut === 'r' && ['services', 'pods'].includes(mode)) {
-        this.setActionLabel(button, t(this.cluster.currentLoad?.phase === 'loading' ? 'action.refreshing' :
-          this.cluster.currentLoad?.phase === 'error' ? 'action.retry' : 'action.refresh'));
-      }
-      if (button.shortcut === 's' && ['forwards', 'groups'].includes(mode)) {
-        this.setActionLabel(button, t(active ? 'action.stop' : 'action.start'));
-      }
-      if (button.shortcut === 'u' && pinViews.includes(mode)) {
-        button.visible = this.canToggleFavorite(current);
-        this.setActionLabel(button, t(favorite ? 'action.unpin' : 'action.pin'));
-      }
-      button.actionActive = mode === 'forwards' && button.shortcut === 'a' && Boolean(this.runningOnly) ||
-        pinViews.includes(mode) && button.shortcut === 'u' && favorite ||
-        mode === 'logs' && button.shortcut === 'v' && this.logViewport.wrap;
-      this.paintButton(button);
-    }
+    });
   }
 
   requestQuit() {
@@ -407,7 +398,7 @@ class KuberikonApp extends ManagementDialogs {
   editCurrent() {
     if (!['forwards', 'groups'].includes(this.tab)) return;
     const item = this.resourceTable.current();
-    if (item?.spec) return this.forwardForm(item.spec, undefined, item);
+    if (item?.spec) return this.forwardForm(item.spec, { record: item });
     else if (item?.forwardIds) this.editGroup(item);
   }
 
@@ -419,11 +410,13 @@ class KuberikonApp extends ManagementDialogs {
   }
 
   controlCurrent(record = this.resourceTable.current()) {
-    const start = !this.forwards.isActive(record);
-    if (start && !this.profile) { this.openProfiles(); return; }
-    if (record?.forwardIds) return start ? this.forwards.startGroup(record) : this.forwards.stopGroup(record);
+    if (record?.forwardIds) {
+      const group = this.templateGroup(record);
+      return this.forwards.isActive(group) ? this.forwards.stopGroup(group) : this.startTemplate(record);
+    }
     if (!record?.spec) { this.setStatus(t('status.startHint')); return; }
-    return start ? this.forwards.start(record) : this.forwards.stop(record);
+    if (record.status === 'stopping') return;
+    return record.want ? this.forwards.stop(record) : this.forwards.start(record);
   }
 
   tick() {
@@ -432,12 +425,12 @@ class KuberikonApp extends ManagementDialogs {
     if (this.cluster.currentLoad?.phase === 'loading') this.updateHeader();
     this.refreshButtons();
     if (!this.logs && !this.small) {
+      this.resourceTable.relatedIndex = null;
       if (this.tab === 'forwards') {
-        this.resourceTable.relatedIndex = null;
         const records = new Map(this.forwards.records.map(record => [record.id, record]));
         this.visibleRows = this.visibleRows.map(record => ({ ...record, ...records.get(record.id) }));
       }
-      if (['pods', 'forwards'].includes(this.tab)) this.resourceTable.updateRowLabels();
+      if (['pods', 'services', 'favorites', 'forwards'].includes(this.tab)) this.resourceTable.updateRowLabels();
       this.resourceTable.updateDetails();
     }
     if (this.logs?.sources.some(source => source.status === 'retrying')) this.updateLogMeta();
@@ -470,11 +463,12 @@ class KuberikonApp extends ManagementDialogs {
     this.pendingUpdate = setImmediate(() => {
       this.pendingUpdate = null;
       if (this.closing) return;
-      if (!this.logs && this.tab !== 'favorites') {
+      if (!this.logs) {
         if (['forwards', 'groups'].includes(this.tab)) this.resourceTable.renderTable();
         else { this.resourceTable.updateRowLabels(); this.resourceTable.updateDetails(); }
       }
       this.updateHeader();
+      if (!this.renderer.hasSelection) this.modal?.refresh?.();
     });
   }
 
@@ -487,30 +481,12 @@ class KuberikonApp extends ManagementDialogs {
     this.cluster.cancelPodDetails();
     this.queries[this.tab] = this.filter.value;
     this.tab = tab;
-    this.filter.value = this.queries[tab];
     this.rows = [];
+    this.filter.value = this.queries[tab];
     this.resourceTable.renderTable();
     this.table.focus();
     this.updateHeader();
     await this.perform(() => this.cluster.refresh());
-  }
-
-  async showInForwards(record = this.resourceTable.current()) {
-    if (record && !record.spec) return this.chooseResourceForward(selected => this.showInForwards(selected), record);
-    if (!record?.spec) return;
-    this.runningOnly = false;
-    this.queries.forwards = '';
-    this.selected.forwards = record.id;
-    await this.switchTab('forwards');
-    if (this.tab !== 'forwards' || this.logs || this.modal || this.closing) return;
-    let index = this.visibleRows.findIndex(item => item.id === record.id);
-    if (index < 0) {
-      this.filter.value = [record.spec.name, record.spec.namespace, record.spec.localPort, record.spec.remotePort, record.spec.address].join(' ');
-      this.queries.forwards = this.filter.value;
-      this.resourceTable.renderTable();
-      index = this.visibleRows.findIndex(item => item.id === record.id);
-    }
-    if (index >= 0) this.resourceTable.selectRow(index);
   }
 
   async chooseNamespace() {
@@ -535,10 +511,12 @@ class KuberikonApp extends ManagementDialogs {
 
   async viewLogs(item = this.resourceTable.current()) {
     if (!item || item.forwardIds) { this.setStatus(t('status.noResource')); return; }
-    if (!this.profile) { this.openProfiles(); return; }
+    if (!this.profile && !item.profile) { this.openProfiles(); return; }
     const controller = this.beginAction();
     const resourceFavorite = Boolean(item.favorite);
-    const profile = item.spec || resourceFavorite ? await this.cluster.backend().resolveProfile({ ...this.profile }, controller.signal) : { ...this.profile };
+    const sourceProfile = item.spec ? item.profile : this.profile;
+    if (!sourceProfile) throw new Error(t(item.profileId ? 'error.profileMissing' : 'error.forwardProfile'));
+    const profile = item.spec || resourceFavorite ? await this.cluster.backend(sourceProfile).resolveProfile({ ...sourceProfile }, controller.signal) : { ...sourceProfile };
     const backend = this.cluster.backend(profile);
     const reference = resourceFavorite ? item.favorite.target : item.spec ?? item;
     const target = item.spec || item.compact || resourceFavorite ?
@@ -905,6 +883,11 @@ class KuberikonApp extends ManagementDialogs {
     if (name === '/') { consume(); this.commands.execute(this.commands.search); return; }
     if (name === 'y') { consume(); void this.perform(() => this.copySelection()); return; }
     if (!this.logs && ['1', '2', '3', '4'].includes(name)) { consume(); void this.switchTab(tabs[Number(name) - 1]); return; }
+    if (!this.logs && clusterTabs.includes(this.tab) && ['p', 's'].includes(name)) {
+      consume();
+      void this.switchTab(name === 'p' ? 'pods' : 'services');
+      return;
+    }
     const command = this.commands.forKey(key, name);
     if (command) {
       consume();
