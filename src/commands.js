@@ -81,11 +81,11 @@ export class AppCommands {
     };
     this.common = [
       { shortcut: 'F2', message: 'action.profiles', run: () => app.openProfiles() },
-      { ...search, shortcut: 'F3' },
+      search,
       { shortcut: 'F4', message: 'action.namespace', run: () => app.chooseNamespace(), defer: true },
       { shortcut: 'F9', message: 'action.settings', run: () => app.settingsInfo() }, this.quit,
     ];
-    this.logCommon = this.common.filter(command => !['F3', 'F4'].includes(command.shortcut));
+    this.logCommon = this.common.filter(command => !['/', 'F4'].includes(command.shortcut));
     this.resourceKeys = [this.quit];
     this.logKeys = [
       { shortcut: 'a', run: () => app.addLogPod(), defer: true },

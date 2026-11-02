@@ -874,7 +874,6 @@ export class KuberikonApp extends ManagementDialogs {
       this.commands.execute(common);
       return;
     }
-    if (key.name === 'f3') { consume(); return; }
     if (key.ctrl && shortcut === 'f') { consume(); this.commands.execute(this.commands.search); return; }
     if (this.renderer.currentFocusedRenderable === this.filter) {
       if (this.logs && key.ctrl && shortcut === 's') { consume(); this.exportLogs(); }
