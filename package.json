@@ -1,6 +1,6 @@
 {
   "name": "kuberikon",
-  "version": "0.1.1",
+  "version": "0.2.0",
   "license": "MIT",
   "description": "Linux TUI for Kubernetes profiles, port forwards and pod logs",
   "repository": {
