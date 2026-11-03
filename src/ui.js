@@ -97,7 +97,7 @@ export class KuberikonApp extends ManagementDialogs {
     this.resourceButtons.forEach(button => { button.visible = false; });
     this.filter = this.input({ width: 'auto', flexGrow: 1, flexShrink: 1, minWidth: 1, value: '', placeholder: t('list.filter'), maxLength: 160 });
     this.filterRow.add(this.filter);
-    this.logFilterButton = this.action(this.filterRow, t('logs.highlightMode'), () => this.toggleLogFilter());
+    this.logFilterButton = this.action(this.filterRow, t('logs.highlightMode'), () => this.toggleLogFilter(), { shortcut: 'f' });
     this.logFilterButton.visible = false;
     this.filter.on('input', () => {
       if (this.logs) {
@@ -341,7 +341,9 @@ export class KuberikonApp extends ManagementDialogs {
     this.directoryMessage.fg = this.directoryError ? this.colors.warn : this.colors.muted;
     this.directoryMessage.content = this.directoryError ? oneLine(this.directoryError) : t('profile.directoryBanner');
     this.filter.placeholder = t(this.logs ? 'logs.filter' : this.tab === 'favorites' ? 'list.favoriteFilter' : 'list.filter');
-    this.logFilterButton.visible = Boolean(this.logs);
+    const showLogFilter = Boolean(this.logs && this.logViewport.query);
+    if (!showLogFilter && this.logFilterButton.focused) (this.logs ? this.logViewport : this.table).focus();
+    this.logFilterButton.visible = showLogFilter;
     this.resourceButtons.forEach((button, index) => {
       button.visible = !this.logs && clusterTabs.includes(this.tab);
       button.actionActive = this.tab === clusterTabs[index];
@@ -377,7 +379,7 @@ export class KuberikonApp extends ManagementDialogs {
     this.actionButtons.forEach((button, index) => {
       const command = commands[index];
       const visible = !command.when || command.when();
-      if (!visible && button.focused) this.table.focus();
+      if (!visible && button.focused) (this.logs ? this.logViewport : this.table).focus();
       button.visible = visible;
       if (visible) {
         button.actionActive = command.active?.() ?? false;

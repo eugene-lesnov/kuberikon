@@ -294,6 +294,7 @@ export class LogViewport extends BoxRenderable {
     if (this.query === value) return;
     this.query = value;
     this.currentMatch = null;
+    if (!value) this.filterOnly = false;
     if (value) this.following = false;
     this.rebuild();
     if (this.query) this.findMatch(1, true);
@@ -301,6 +302,7 @@ export class LogViewport extends BoxRenderable {
   }
 
   toggleFilter() {
+    if (!this.query) return;
     this.filterOnly = !this.filterOnly;
     this.rebuild();
     if (this.currentMatch) this.showMatch();

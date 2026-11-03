@@ -802,7 +802,10 @@ export class ManagementDialogs extends Dialogs {
       return;
     }
     const logs = this.logs;
-    const buffered = logs.buffer.matching(this.logViewport.query).map(record => ({ display: record.display }));
+    this.flushLogs(true);
+    const buffered = this.logViewport.entries
+      .filter(entry => !this.logViewport.query || entry.hitCount)
+      .map(entry => ({ display: entry.text }));
     const modal = this.showModal(t('logs.export'), { width: 96, height: Math.min(24, this.renderer.height - 2) });
     this.label(modal.dialog, t('logs.exportMode'));
     const mode = this.select({ height: 2,
