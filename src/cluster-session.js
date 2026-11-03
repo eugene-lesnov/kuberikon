@@ -76,7 +76,7 @@ export class ClusterSession {
   async refresh({ background = false } = {}) {
     const app = this.app;
     const key = this.listKey();
-    if (this.request && !this.request.signal.aborted && this.loadState?.key === key) return;
+    if (background && this.request && !this.request.signal.aborted && this.loadState?.key === key) return;
     this.request?.abort();
     this.request = null;
     const generation = ++this.generation;
