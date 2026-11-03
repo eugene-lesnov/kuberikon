@@ -168,7 +168,8 @@ export class KeyboardNavigation {
     if (focused === app.logViewport && !app.modal) {
       if (['up', 'down'].includes(name)) {
         const index = focused.entries.findIndex(entry => entry.record === focused.detailRecord);
-        if (!focused.entries.length || index >= 0 && (index + direction < 0 || index + direction >= focused.entries.length)) this.moveFocus(name);
+        if (direction < 0 && (!focused.entries.length || index === 0) && app.logStreams.hasOlderLogs() && !app.logs.historyError) focused.goStart();
+        else if (!focused.entries.length || index >= 0 && (index + direction < 0 || index + direction >= focused.entries.length)) this.moveFocus(name);
         else focused.selectRecord(direction);
       } else if (name.startsWith('page')) focused.moveBy(direction * Math.max(1, focused.contentHeight - 1));
       else if (name === 'home') focused.goStart();

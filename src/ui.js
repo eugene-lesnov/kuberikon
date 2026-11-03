@@ -645,6 +645,7 @@ export class KuberikonApp extends ManagementDialogs {
     if (!logs || this.closing) return;
     if (logs.wasFollowing && !this.logViewport.following) logs.pausedAt = logs.buffer.sequence;
     logs.wasFollowing = this.logViewport.following;
+    this.logStreams.scheduleLogHistory();
     this.updateLogMeta();
     this.updateActions();
   }
@@ -706,7 +707,14 @@ export class KuberikonApp extends ManagementDialogs {
     const parts = [];
     if (this.logViewport.query) parts.push(t('logs.matches', { current: this.logViewport.matchIndex, count: this.logViewport.matchCount }));
     parts.push(t('logs.buffered', { count: buffer.records.length }));
+    if (logs.historyRequest || logs.historyTimer) parts.push(t(this.logViewport.query ? 'logs.searchingHistory' : 'logs.loadingHistory'));
+    else if (logs.historyError) parts.push(t('logs.historyIncomplete'));
     this.logMeta.content = parts.join(' · ');
+    const searchMessage = t(this.logViewport.query && this.logStreams.hasOlderLogs(logs) && !logs.historyError ? 'logs.searchingHistory' : 'logs.noMatches');
+    if (this.logViewport.searchMessage !== searchMessage) {
+      this.logViewport.searchMessage = searchMessage;
+      this.logViewport.draw();
+    }
     this.navigation.refresh();
   }
 
@@ -723,7 +731,10 @@ export class KuberikonApp extends ManagementDialogs {
 
   findLogMatch(direction = 1) {
     if (!this.logs || !this.logViewport.query) { this.focusSearch(); return; }
-    if (!this.logViewport.findMatch(direction)) this.setStatus(t('logs.noMatches'));
+    if (!this.logViewport.findMatch(direction)) {
+      const searching = this.logStreams.hasOlderLogs() && !this.logs.historyError;
+      this.setStatus(t(searching ? 'logs.searchingHistory' : 'logs.noMatches'));
+    }
     else if (this.logViewport.currentMatch?.sourceOnly) this.setStatus(t('logs.sourceMatch'));
   }
 
@@ -780,6 +791,7 @@ export class KuberikonApp extends ManagementDialogs {
     if (invalidate) this.logGeneration++;
     const logs = this.logs;
     if (!logs) return;
+    this.logStreams.cancelLogHistory(logs);
     if (this.actionRequest === logs.actionRequest) logs.actionRequest?.abort();
     this.logs = null;
     this.logViewport.reset();

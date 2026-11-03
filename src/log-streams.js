@@ -1,5 +1,5 @@
 import { limitRecord } from './text.js';
-import { LogBuffer } from './logs.js';
+import { LogBuffer, initialLogLines } from './logs.js';
 import { t } from './i18n/index.js';
 
 const permanentLogError = /forbidden|unauthorized|permission denied|\b(?:ENOENT|ENOTDIR|EISDIR|EACCES)\b|unknown flag|unknown command|invalid configuration|error loading config|kubeconfig|\.kuber|current-context|selected context|static credentials|not found in PATH|no context exists|context .*does not exist|certificate (?:has expired|signed by unknown|is not)|x509:|container .* (?:not found|not valid)|container .* is not valid/i;
@@ -16,6 +16,8 @@ export class LogStreams {
     const logs = app.logs;
     if (!logs || app.closing || !candidates.length || candidates.length > 16) return;
     if (!automatic) this.beginLogAction(logs);
+    this.cancelLogHistory(logs);
+    logs.historyError = null;
     const revision = logs.sourceRevision = (logs.sourceRevision ?? 0) + 1;
     const previous = logs.sources;
     const sources = candidates.map(candidate => previous.find(source => this.logSourceKey(source) === this.logSourceKey(candidate)) ?? {
@@ -28,6 +30,7 @@ export class LogStreams {
     for (const source of history) {
       source.caption = combined ? `${source.pod.name}/${source.container}` : '';
     }
+    logs.buffer.displayed = 0;
     const stopped = previous.filter(source => !sources.includes(source) || restart);
     const closing = Promise.allSettled(stopped.map(source => this.stopLogSource(source)));
     this.logClosures.add(closing);
@@ -37,7 +40,10 @@ export class LogStreams {
     if (restart) {
       logs.buffer.clear();
       app.resetLogHistory();
-      for (const source of sources) { source.lastTimestamp = null; source.retries = 0; }
+      for (const source of sources) {
+        source.lastTimestamp = null; source.retries = 0;
+        source.historyComplete = false; source.historyTail = initialLogLines;
+      }
     }
     for (const source of sources) {
       if (logs.sources.includes(source) && (!previous.includes(source) || restart) && !source.handle) this.openLogStream(logs, source);
@@ -47,81 +53,124 @@ export class LogStreams {
     this.logMessage(logs, failure || t('logs.open'), Boolean(failure));
     app.updateHeader();
     app.flushLogs(true);
+    this.scheduleLogHistory();
   }
 
-  async reloadLogs() {
+  cancelLogHistory(logs) {
+    clearTimeout(logs.historyTimer);
+    logs.historyTimer = null;
+    logs.historyController?.abort();
+  }
+
+  hasOlderLogs(logs = this.app.logs) {
+    return Boolean(logs?.sources.some(source => !source.historyComplete));
+  }
+
+  scheduleLogHistory() {
     const app = this.app;
     const logs = app.logs;
-    if (!logs || logs.reconnecting) return;
-    logs.reconnecting = true;
-    const controller = this.beginLogAction(logs);
-    const sources = [...logs.sources];
+    if (!logs || app.closing) return;
+    const query = app.logViewport.query;
+    if (logs.historyQuery !== query) {
+      logs.historyQuery = query;
+      logs.historyError = null;
+      clearTimeout(logs.historyTimer);
+      logs.historyTimer = null;
+    }
+    const wanted = query || !app.logViewport.following && app.logViewport.scrollTop < Math.max(1, app.logViewport.contentHeight);
+    if (!wanted) { clearTimeout(logs.historyTimer); logs.historyTimer = null; return; }
+    if (logs.historyRequest || logs.historyTimer || logs.historyError || !this.hasOlderLogs(logs)) return;
+    logs.historyTimer = setTimeout(() => {
+      logs.historyTimer = null;
+      void this.loadLogHistory();
+    }, query ? 300 : 100);
+    app.updateLogMeta();
+  }
+
+  reloadLogs() {
+    return this.loadLogHistory({ reload: true });
+  }
+
+  loadLogHistory({ reload = false } = {}) {
+    const app = this.app;
+    const logs = app.logs;
+    if (!logs || app.closing) return Promise.resolve();
+    if (logs.historyRequest) return logs.historyRequest;
+    if (!reload && !this.hasOlderLogs(logs)) return Promise.resolve();
+    clearTimeout(logs.historyTimer);
+    logs.historyTimer = null;
+    logs.historyError = null;
+    logs.historyQuery ??= app.logViewport.query;
     const revision = logs.sourceRevision;
-    const checkpoint = logs.buffer.sequence;
-    const history = new LogBuffer();
-    history.sequence = checkpoint;
-    this.logMessage(logs, t('logs.reloadingHistory'));
-    const reading = Promise.allSettled(sources.map(source => this.readLogHistory(logs, source, controller.signal, history)));
-    this.logClosures.add(reading);
-    try {
-      const results = await reading;
-      if (app.logs !== logs || app.closing || logs.sourceRevision !== revision) return;
-      if (controller.signal.aborted) { this.logMessage(logs, t('logs.historyReloadCancelled')); return; }
-      const failure = results.find(result => result.status === 'rejected');
-      if (failure) { this.logMessage(logs, t('logs.historyReloadFailed', { reason: failure.reason.message }), true); return; }
-      const replay = new Map(sources.map(source => [source, new Map()]));
-      for (const record of history.records) {
-        const counts = replay.get(record.source);
-        counts.set(record.text, (counts.get(record.text) ?? 0) + 1);
-      }
-      const loaded = new Map([...replay].map(([source, counts]) => [source, new Map(counts)]));
-      for (const record of logs.buffer.records) {
-        const counts = replay.get(record.source);
-        const remaining = counts?.get(record.text) ?? 0;
-        if (!record.error && remaining) counts.set(record.text, remaining - 1);
-      }
-      for (const source of sources) {
-        const pending = new Map();
-        for (const [text, count] of loaded.get(source)) {
-          const remaining = (replay.get(source).get(text) ?? 0) + (source.historyReplay?.get(text) ?? 0);
-          if (remaining) pending.set(text, Math.min(count, remaining));
-        }
-        source.historyReplay = pending.size ? pending : null;
-      }
-      history.sequence = Math.max(history.sequence, logs.buffer.sequence);
-      for (const record of logs.buffer.records) {
-        if (record.sequence <= checkpoint) continue;
-        const counts = loaded.get(record.source);
-        const remaining = counts?.get(record.text) ?? 0;
-        if (!record.error && remaining) counts.set(record.text, remaining - 1);
-        else history.add(record.text, record.error, record.source);
-      }
-      logs.buffer = history;
-      app.resetLogHistory();
-      logs.pausedAt = history.sequence;
-      logs.dirty = true;
+    const controller = reload ? this.beginLogAction(logs) : new AbortController();
+    logs.historyController = controller;
+    if (reload) this.logMessage(logs, t('logs.reloadingHistory'));
+    const work = this.readMoreLogHistory(logs, controller, reload).catch(error => {
+      if (app.logs !== logs || app.closing || controller.signal.aborted) return;
+      logs.historyError = error.message;
+      this.logMessage(logs, t('logs.historyReloadFailed', { reason: error.message }), true);
+    }).finally(() => {
+      this.logClosures.delete(work);
+      if (logs.historyRequest !== work) return;
+      logs.historyRequest = null;
+      logs.historyController = null;
+      if (app.logs !== logs || app.closing) return;
+      if (!controller.signal.aborted || logs.sourceRevision !== revision) this.scheduleLogHistory();
+      else if (reload) this.logMessage(logs, t('logs.historyReloadCancelled'));
+      app.updateLogMeta();
       app.flushLogs(true);
-      for (const result of results) {
-        const { source, pod, lastTimestamp } = result.value;
-        if (source.handle || source.recoveryController) continue;
-        clearTimeout(source.retryTimer);
-        source.retryTimer = null;
-        source.retryAt = null;
-        source.retries = 0; source.connectedAt = null;
-        source.pod = pod;
-        source.lastTimestamp = lastTimestamp;
-        if (pod.terminalContainers?.includes(source.container) || ['Completed', 'Failed'].includes(pod.status)) source.status = 'ended';
-        else this.openLogStream(logs, source);
-      }
-      this.logMessage(logs, t('logs.historyReloaded', { count: history.records.length }));
-    } finally {
-      this.logClosures.delete(reading);
-      logs.reconnecting = false;
-      if (app.logs === logs && !app.closing) app.updateHeader();
+    });
+    logs.historyRequest = work;
+    this.logClosures.add(work);
+    app.updateLogMeta();
+    return work;
+  }
+
+  async readMoreLogHistory(logs, controller, reload) {
+    const app = this.app;
+    const sources = logs.sources.filter(source => reload || !source.historyComplete);
+    const revision = logs.sourceRevision;
+    const history = new LogBuffer();
+    const counts = new Map(sources.map(source => [source, 0]));
+    for (const record of logs.buffer.records) {
+      if (!record.error && counts.has(record.source)) counts.set(record.source, counts.get(record.source) + 1);
+    }
+    const results = await Promise.allSettled(sources.map(source => {
+      const depth = Math.max(initialLogLines, source.historyTail ?? 0, counts.get(source));
+      const tail = reload ? depth : Math.min(Number.MAX_SAFE_INTEGER, depth * 2);
+      return this.readLogHistory(logs, source, controller.signal, history, tail);
+    }));
+    if (app.logs !== logs || app.closing || logs.sourceRevision !== revision || controller.signal.aborted) return;
+    const failure = results.find(result => result.status === 'rejected');
+    if (failure) throw failure.reason;
+    for (const record of logs.buffer.merge(history)) {
+      if (!record.source.handle || record.source.lastTimestamp && record.time < Date.parse(record.source.lastTimestamp)) continue;
+      const pending = record.source.historyReplay ??= new Map();
+      pending.set(record.text, (pending.get(record.text) ?? 0) + 1);
+    }
+    for (const { value: { source, pod, lastTimestamp, count, tail } } of results) {
+      source.historyTail = tail;
+      source.historyComplete = count < tail;
+      if (!reload || source.handle || source.recoveryController) continue;
+      clearTimeout(source.retryTimer);
+      source.retryTimer = null;
+      source.retryAt = null;
+      source.retries = 0; source.connectedAt = null;
+      source.pod = pod;
+      source.lastTimestamp = lastTimestamp ?? source.lastTimestamp;
+      if (pod.terminalContainers?.includes(source.container) || ['Completed', 'Failed'].includes(pod.status)) source.status = 'ended';
+      else this.openLogStream(logs, source);
+    }
+    logs.dirty = true;
+    app.flushLogs(true);
+    if (app.logViewport.query && !app.logViewport.currentMatch && !app.logViewport.following) app.logViewport.findMatch(1, true);
+    if (reload) this.logMessage(logs, t('logs.historyReloaded', { count: logs.buffer.records.length }));
+    else if (app.logViewport.query && !this.hasOlderLogs(logs)) {
+      this.logMessage(logs, t(app.logViewport.matchCount ? 'logs.historySearched' : 'logs.noMatches', { count: app.logViewport.matchCount }));
     }
   }
 
-  async readLogHistory(logs, source, signal, history) {
+  async readLogHistory(logs, source, signal, history, tail = initialLogLines) {
     const backend = this.app.cluster.backend(logs.profile);
     const pod = await backend.resource(logs.profile, source.pod, signal, { fresh: true });
     if (signal.aborted) throw new DOMException(t('error.requestCancelled'), 'AbortError');
@@ -129,16 +178,18 @@ export class LogStreams {
     if (!pod.containers.includes(source.container)) throw new Error(t('logs.containerMissing', { name: source.container }));
     let diagnostic = '';
     let lastTimestamp;
+    let count = 0;
     const handle = backend.logs(logs.profile, pod, source.container, {
       onLine: (text, error) => {
         if (error) diagnostic = (diagnostic + '\n' + text).slice(-8192);
         else {
+          count++;
           history.add(text, false, source);
           const timestamp = /^(\d{4}-\d{2}-\d{2}T\S+)\s/.exec(text)?.[1];
           if (timestamp && Number.isFinite(Date.parse(timestamp))) lastTimestamp = timestamp;
         }
       },
-    }, { follow: false, tail: 300 });
+    }, { follow: false, tail });
     let failure;
     const abort = () => { failure = new DOMException(t('error.requestCancelled'), 'AbortError'); void handle.stop(); };
     signal.addEventListener('abort', abort, { once: true });
@@ -151,7 +202,7 @@ export class LogStreams {
       const result = await handle.done;
       if (failure) throw failure;
       if (result.error || result.code !== 0) throw new Error(result.error?.message || diagnostic.trim() || t('error.kubectlExit', { code: result.code }));
-      return { source, pod, lastTimestamp };
+      return { source, pod, lastTimestamp, count, tail };
     } finally {
       clearTimeout(timer);
       signal.removeEventListener('abort', abort);
@@ -185,8 +236,9 @@ export class LogStreams {
     let permanent = false;
     const replay = new Map();
     if (source.lastTimestamp) {
+      const since = Date.parse(source.lastTimestamp);
       for (const record of logs.buffer.records) {
-        if (!record.error && this.logSourceKey(record.source) === this.logSourceKey(source)) {
+        if (!record.error && record.time >= since && this.logSourceKey(record.source) === this.logSourceKey(source)) {
           replay.set(record.text, (replay.get(record.text) ?? 0) + 1);
         }
       }
@@ -233,7 +285,7 @@ export class LogStreams {
           if (source.status === 'error' && source.message) this.logMessage(logs, source.message, true);
           app.updateHeader();
         },
-      }, source.lastTimestamp ? { sinceTime: source.lastTimestamp, tail: -1 } : undefined);
+      }, source.lastTimestamp ? { sinceTime: source.lastTimestamp, tail: -1 } : { tail: initialLogLines });
       source.handle = handle;
       source.status = 'live';
       source.connectedAt = Date.now();

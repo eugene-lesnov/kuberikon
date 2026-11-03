@@ -5,6 +5,7 @@ import { randomUUID } from 'node:crypto';
 import { t } from './i18n/index.js';
 import { validNamespace, validResourceName, isProfileFile } from './config.js';
 import { readKubeconfig } from './kubeconfig.js';
+import { initialLogLines } from './logs.js';
 
 export const expandPath = value => resolve(value.replace(/^~(?=\/|$)/, homedir()));
 export const fileProfile = file => ({ name: basename(file).replace(/\.[^.]+$/, '') || basename(file), file: expandPath(file), mode: 'live' });
@@ -172,7 +173,7 @@ export class KubeBackend {
     return prepared?.privileged ? this.privileged.forward(spec, start, callbacks) : start(spec.localPort, spec.address, callbacks);
   }
 
-  logs(profile, pod, container, callbacks, { follow = true, tail = 300, sinceTime } = {}) {
+  logs(profile, pod, container, callbacks, { follow = true, tail = initialLogLines, sinceTime } = {}) {
     return this.pool.start(['logs', ...this.args(profile), `--namespace=${pod.namespace}`, pod.name,
       `--container=${container}`, ...(follow ? ['--follow=true'] : []), `--tail=${tail}`, '--timestamps=true',
       ...(sinceTime ? [`--since-time=${sinceTime}`] : [])], callbacks);

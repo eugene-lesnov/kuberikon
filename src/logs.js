@@ -8,31 +8,58 @@ import { StringDecoder } from 'node:string_decoder';
 import { limitRecord } from './text.js';
 import { t } from './i18n/index.js';
 
+export const initialLogLines = 500;
+
 export class LogBuffer {
   records = [];
-  bytes = 0;
   sequence = 0;
+  displayed = 0;
 
-  clear() { this.records = []; this.bytes = 0; }
+  clear() { this.records = []; this.displayed = 0; }
 
   add(text, error, source) {
     const value = limitRecord(text);
-    const record = { text: value, error, source, sequence: ++this.sequence };
+    const timestamp = /^(\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2})(?:\.(\d+))?(Z|[+-]\d{2}:\d{2})\s/.exec(value);
+    const time = timestamp ? Date.parse(timestamp[0].trim()) : NaN;
+    const record = { text: value, error, source, sequence: ++this.sequence,
+      time: Number.isFinite(time) ? time : Date.now(), fraction: timestamp?.[2]?.padEnd(9, '0') ?? '000000000' };
     this.records.push(record);
-    this.bytes += Buffer.byteLength(value);
-    while (this.records.length > 2000 || this.bytes > 2 * 1024 * 1024) this.bytes -= Buffer.byteLength(this.records.shift().text);
+  }
+
+  merge(history) {
+    const existing = new Map();
+    for (const record of this.records) {
+      if (record.error) continue;
+      let counts = existing.get(record.source);
+      if (!counts) existing.set(record.source, counts = new Map());
+      counts.set(record.text, (counts.get(record.text) ?? 0) + 1);
+    }
+    const added = [];
+    for (const record of history.records) {
+      const counts = existing.get(record.source);
+      const remaining = counts?.get(record.text) ?? 0;
+      if (remaining) counts.set(record.text, remaining - 1);
+      else {
+        record.sequence = 0;
+        added.push(record);
+      }
+    }
+    if (added.length) {
+      this.records = this.records.concat(added).sort((left, right) => left.time - right.time || left.fraction.localeCompare(right.fraction));
+      this.displayed = 0;
+    }
+    return added;
   }
 
   matching(query = '') {
     const lower = query.toLowerCase();
-    return this.records.flatMap(record => {
-      if (record.display === undefined || record.caption !== record.source.caption) {
-        record.caption = record.source.caption;
-        record.display = (record.caption ? `[${record.caption}] ` : '') + record.text;
-      }
-      if (lower && ![record.display, record.source.label].some(text => text.toLowerCase().includes(lower))) return [];
-      return [record];
-    });
+    for (let index = this.displayed; index < this.records.length; index++) {
+      const record = this.records[index];
+      record.caption = record.source.caption;
+      record.display = (record.caption ? `[${record.caption}] ` : '') + record.text;
+    }
+    this.displayed = this.records.length;
+    return lower ? this.records.filter(record => [record.display, record.source.label].some(text => text.toLowerCase().includes(lower))) : this.records;
   }
 }
 

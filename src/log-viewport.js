@@ -67,6 +67,7 @@ export class LogViewport extends BoxRenderable {
     this.onChange = onChange;
     this.rows = [];
     this.records = [];
+    this.recordSource = null;
     this.entries = [];
     this.selectedRecord = null;
     this.query = '';
@@ -110,6 +111,7 @@ export class LogViewport extends BoxRenderable {
   reset() {
     this.stopDrag();
     this.records = [];
+    this.recordSource = null;
     this.entries = [];
     this.entriesByRecord = new Map();
     this.allEntries = new Map();
@@ -138,25 +140,29 @@ export class LogViewport extends BoxRenderable {
   }
 
   setRecords(records) {
-    if (records.length === this.records.length && records.every((record, index) => record === this.records[index] &&
-      record.display === this.allEntries?.get(record)?.text)) return;
+    const last = this.records.at(-1);
+    const append = this.recordSource === records && records.length >= this.records.length &&
+      (!last || last.display === this.allEntries?.get(last)?.text);
+    if (append && records.length === this.records.length) return;
     const anchor = this.anchor();
+    const start = append ? this.records.length : 0;
+    this.recordSource = records;
     this.records = [...records];
-    if (!records.includes(this.selectedRecord)) this.selectedRecord = null;
-    this.rebuild(anchor);
+    this.rebuild(anchor, start);
   }
 
-  rebuild(anchor = this.anchor()) {
+  rebuild(anchor = this.anchor(), start = 0) {
     const previous = this.allEntries ?? new Map();
     const shift = (point, record, delta, key = 'offset') => point?.record === record ?
       { ...point, [key]: Math.max(0, point[key] + delta) } : point;
-    const allEntries = new Map();
-    const entriesByRecord = new Map();
-    const entries = [];
+    const allEntries = start ? previous : new Map();
+    const entriesByRecord = start ? this.entriesByRecord : new Map();
+    const entries = start ? this.entries : [];
     const pattern = this.query ? literalPattern(this.query) : null;
-    let total = 0;
-    let matches = 0;
-    for (const record of this.records) {
+    let total = start ? this.total : 0;
+    let matches = start ? this.matchCount : 0;
+    for (let index = start; index < this.records.length; index++) {
+      const record = this.records[index];
       const text = record.display ?? '';
       const cached = previous.get(record);
       const caption = record.caption ?? '';
@@ -239,7 +245,7 @@ export class LogViewport extends BoxRenderable {
   get maxTop() { return Math.max(0, this.total - this.contentHeight); }
   get emptyRows() { return Math.max(0, this.contentHeight - this.total); }
 
-  entryAt(row) {
+  entryIndexAt(row) {
     let low = 0;
     let high = this.entries.length - 1;
     while (low < high) {
@@ -247,8 +253,10 @@ export class LogViewport extends BoxRenderable {
       if (this.entries[middle].row <= row) low = middle;
       else high = middle - 1;
     }
-    return this.entries[low];
+    return low;
   }
+
+  entryAt(row) { return this.entries[this.entryIndexAt(row)]; }
 
   rowAt(entry, offset) {
     let index = 0;
@@ -268,8 +276,8 @@ export class LogViewport extends BoxRenderable {
     this.onChange?.();
   }
 
-  moveBy(delta, followEnd = true) { this.setTop(this.scrollTop + delta, followEnd); }
-  goStart() { this.setTop(0); }
+  moveBy(delta, followEnd = true) { this.setTop(this.scrollTop + delta, followEnd && delta >= 0); }
+  goStart() { this.setTop(0, false); }
   goEnd() { this.selectedRecord = null; this.currentMatch = null; this.following = true; this.scrollTop = this.maxTop; this.draw(); this.onChange?.(); }
   pause() { this.following = false; this.onChange?.(); }
   toggleFollow() { if (this.following) this.pause(); else this.goEnd(); }
@@ -286,6 +294,7 @@ export class LogViewport extends BoxRenderable {
     if (this.query === value) return;
     this.query = value;
     this.currentMatch = null;
+    if (value) this.following = false;
     this.rebuild();
     if (this.query) this.findMatch(1, true);
     this.onChange?.();
@@ -347,8 +356,8 @@ export class LogViewport extends BoxRenderable {
 
   visibleRows() {
     const visible = [];
-    for (const entry of this.entries) {
-      if (entry.row + entry.count <= this.scrollTop) continue;
+    for (let index = this.entryIndexAt(this.scrollTop); index < this.entries.length; index++) {
+      const entry = this.entries[index];
       if (entry.row >= this.scrollTop + this.contentHeight) break;
       let row = entry.row;
       for (const span of screenRows(entry.text, entry.width, entry.wrap)) {
@@ -506,7 +515,7 @@ export class LogViewport extends BoxRenderable {
       this.rows[y].bg = row?.entry.record === this.selectedRecord ? this.focused ? this.colors.selected : this.colors.input :
         row?.entry.sourceOnly && row.entry.record === this.currentMatch?.record ? this.colors.mark : this.colors.background;
       if (!row) {
-        const empty = this.query && this.filterOnly ? t('logs.noMatches') : this.emptyMessage ?? t('logs.empty');
+        const empty = this.query && this.filterOnly ? this.searchMessage ?? t('logs.noMatches') : this.emptyMessage ?? t('logs.empty');
         this.rows[y].content = !this.entries.length && y === Math.min(1, this.rows.length - 1) ? empty : '';
         continue;
       }
