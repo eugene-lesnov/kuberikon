@@ -72,6 +72,7 @@ export class LogViewport extends BoxRenderable {
     this.selectedRecord = null;
     this.query = '';
     this.wrap = true;
+    this.separators = false;
     this.filterOnly = false;
     this.following = true;
     this.scrollTop = 0;
@@ -122,6 +123,7 @@ export class LogViewport extends BoxRenderable {
     this.query = '';
     this.filterOnly = false;
     this.wrap = true;
+    this.separators = false;
     this.following = true;
     this.scrollTop = 0;
     this.total = 0;
@@ -132,6 +134,7 @@ export class LogViewport extends BoxRenderable {
   anchor() {
     const entry = this.entryAt(this.scrollTop);
     if (!entry) return null;
+    if (this.scrollTop < entry.row) return { record: entry.record, offset: 0, separator: true };
     let row = 0;
     for (const span of screenRows(entry.text, entry.width, entry.wrap)) {
       if (row++ === this.scrollTop - entry.row) return { record: entry.record, offset: span.start };
@@ -195,6 +198,7 @@ export class LogViewport extends BoxRenderable {
         hits, sourceOnly, hitCount, hit: matches, row: total, count, caption };
       allEntries.set(record, entry);
       if (this.filterOnly && this.query && !hitCount) continue;
+      if (this.separators && entries.length) entry.row = ++total;
       entriesByRecord.set(record, entry);
       entries.push(entry);
       total += count;
@@ -213,6 +217,7 @@ export class LogViewport extends BoxRenderable {
     else if (anchor) {
       const entry = entriesByRecord.get(anchor.record) ?? entries.find(item => item.record.sequence > anchor.record.sequence) ?? entries.at(-1);
       this.scrollTop = entry ? entry.row + (entry.record === anchor.record ? this.rowAt(entry, anchor.offset) : 0) : 0;
+      if (anchor.separator && this.separators && entry?.record === anchor.record && entry.row > 0) this.scrollTop = entry.row - 1;
     }
     this.scrollTop = Math.max(0, Math.min(this.maxTop, this.scrollTop));
     this.draw();
@@ -249,9 +254,10 @@ export class LogViewport extends BoxRenderable {
     let low = 0;
     let high = this.entries.length - 1;
     while (low < high) {
-      const middle = Math.ceil((low + high) / 2);
-      if (this.entries[middle].row <= row) low = middle;
-      else high = middle - 1;
+      const middle = Math.floor((low + high) / 2);
+      const entry = this.entries[middle];
+      if (entry.row + entry.count <= row) low = middle + 1;
+      else high = middle;
     }
     return low;
   }
@@ -286,6 +292,13 @@ export class LogViewport extends BoxRenderable {
     if (this.wrap === value) return;
     const anchor = this.anchor();
     this.wrap = value;
+    this.rebuild(anchor);
+    this.onChange?.();
+  }
+
+  toggleSeparators() {
+    const anchor = this.anchor();
+    this.separators = !this.separators;
     this.rebuild(anchor);
     this.onChange?.();
   }
@@ -404,6 +417,7 @@ export class LogViewport extends BoxRenderable {
     if (!clamp && (row < 0 || row >= this.total)) return null;
     row = Math.max(0, Math.min(this.total - 1, row));
     const entry = this.entryAt(row);
+    if (row < entry.row) return clamp ? { record: entry.record, offset: 0, end: 0 } : null;
     let index = entry.row;
     for (const span of screenRows(entry.text, entry.width, entry.wrap)) {
       if (index++ !== row) continue;
@@ -517,8 +531,13 @@ export class LogViewport extends BoxRenderable {
       this.rows[y].bg = row?.entry.record === this.selectedRecord ? this.focused ? this.colors.selected : this.colors.input :
         row?.entry.sourceOnly && row.entry.record === this.currentMatch?.record ? this.colors.mark : this.colors.background;
       if (!row) {
-        const empty = this.query && this.filterOnly ? this.searchMessage ?? t('logs.noMatches') : this.emptyMessage ?? t('logs.empty');
-        this.rows[y].content = !this.entries.length && y === Math.min(1, this.rows.length - 1) ? empty : '';
+        let content = '';
+        if (this.entries.length && this.separators && y >= this.emptyRows) {
+          content = '  ' + '─'.repeat(Math.min(12, this.contentWidth));
+        } else if (!this.entries.length && y === Math.min(1, this.rows.length - 1)) {
+          content = this.query && this.filterOnly ? this.searchMessage ?? t('logs.noMatches') : this.emptyMessage ?? t('logs.empty');
+        }
+        this.rows[y].content = content;
         continue;
       }
       const { entry, start } = row;
@@ -540,8 +559,11 @@ export class LogViewport extends BoxRenderable {
       if (range && entry.row >= a.row && entry.row <= b.row) marks.push({ from: entry === a ? range.a.offset : 0,
         to: entry === b ? range.b.offset : entry.text.length, color: this.colors.selected, priority: 2 });
       const cuts = [...new Set([start, end, ...marks.flatMap(mark => [Math.max(start, Math.min(end, mark.from)), Math.max(start, Math.min(end, mark.to))])])].sort((left, right) => left - right);
-      const cursor = entry.record === this.selectedRecord && (y === 0 || visible.get(y - 1)?.entry !== entry);
-      const chunks = [fg(this.colors.accent)(cursor ? '▶ ' : entry.record === this.selectedRecord ? '┃ ' : '  ')];
+      const selected = entry.record === this.selectedRecord;
+      const marker = selected
+        ? fg(this.colors.accent)(start === 0 ? '▶ ' : '┃ ')
+        : fg(this.colors.muted)('  ');
+      const chunks = [marker];
       for (let index = 0; index + 1 < cuts.length; index++) {
         const from = cuts[index], to = cuts[index + 1];
         if (from === to) continue;

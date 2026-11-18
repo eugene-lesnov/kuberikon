@@ -116,6 +116,7 @@ Quitting stops all connections.
 | `r` | Refresh a resource list or reload log history |
 | `Space` / `End` in logs | Toggle following / return to the latest records |
 | `v` in logs | Toggle line wrapping |
+| `s` in logs | Toggle horizontal separators between records |
 | `e` in logs | Export logs |
 | `Esc` | Clear a selection or search, close a dialog, or return from logs |
 | `F9` | Settings |
