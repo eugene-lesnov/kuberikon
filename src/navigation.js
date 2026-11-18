@@ -115,11 +115,11 @@ export class KeyboardNavigation {
       const other = vertical ? control.x : control.y;
       const otherSize = vertical ? control.width : control.height;
       const distance = forward ? position - start - size : start - position - extent;
-      const gap = Math.max(0, other - cross - crossSize, cross - other - otherSize);
+      const crossGap = Math.max(other - cross - crossSize, cross - other - otherSize);
       const center = Math.abs(other + otherSize / 2 - cross - crossSize / 2);
-      return { control, distance, score: distance + gap * 2, center };
+      return { control, distance, aligned: crossGap < 0, score: distance + Math.max(0, crossGap) * 2, center };
     }).filter(candidate => candidate.distance >= 0);
-    candidates.sort((a, b) => vertical ? a.distance - b.distance || a.control.x - b.control.x :
+    candidates.sort((a, b) => Number(b.aligned) - Number(a.aligned) ||
       a.score - b.score || a.center - b.center);
     const next = candidates[0]?.control ?? (!vertical ? controls[controls.indexOf(current) + (forward ? 1 : -1)] : null);
     this.focus(next);
