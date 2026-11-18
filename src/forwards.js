@@ -266,7 +266,7 @@ export class ForwardManager extends EventEmitter {
     const ids = new Set(this.configurations.filter(record => record.profileId === profileId).map(record => record.id));
     for (const [id, operation] of this.groups) if (operation.forwardIds.some(id => ids.has(id))) this.groups.delete(id);
     await Promise.all([...this.sessions.values()].filter(session =>
-      (session.profile?.id ?? session.configuration.profileId) === profileId).map(session => this.stop(session)));
+      (session.profile?.id ?? session.configuration.profileId) === profileId && this.isActive(session)).map(session => this.stop(session)));
   }
 
   async suspend(record) { this.suspended.add(record.id); await this.stop(record); }

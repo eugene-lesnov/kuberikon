@@ -181,7 +181,8 @@ export class ClusterSession {
         this.loadState = null;
         this.generation++;
         await app.closeLogs();
-        if (changingProfile && app.profile.id === resolved.id) await app.forwards.stopProfile(resolved.id);
+        if (controller.signal.aborted || app.closing) return;
+        if (changingProfile) await app.forwards.stopProfile(app.profile.id);
         if (controller.signal.aborted || app.closing) return;
         app.profile = resolved;
         app.resourceTable.relatedIndex = null;

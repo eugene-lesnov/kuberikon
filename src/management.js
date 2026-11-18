@@ -215,7 +215,7 @@ export class ManagementDialogs extends Dialogs {
       resolved = { ...group, sourceId: group.id, id: JSON.stringify([group.id, profileId]), forwardIds: [...new Set(forwardIds)] };
       return data;
     });
-    if (this.closing || this.profile?.id !== profileId) return;
+    if (this.closing || this.switching || this.profile?.id !== profileId) return;
     return this.forwards.startGroup(resolved);
   }
 

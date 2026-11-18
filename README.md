@@ -97,9 +97,10 @@ profile chosen during initial setup. Switching profiles later does not trigger
 autostart.
 
 Favorites and templates use the selected profile. Starting a template creates
-or reuses connections belonging to that profile. Each connection remembers its
-profile, and switching profiles leaves existing connections running. Editing
-or deleting a profile stops its connections. Quitting stops all connections.
+or reuses connections belonging to that profile. Switching profiles stops the
+previous profile's forwards. Their settings are saved so you can restart them
+with **f** when you return. Editing or deleting a profile stops its connections.
+Quitting stops all connections.
 
 | Key | Action |
 | --- | --- |
