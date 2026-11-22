@@ -47,9 +47,9 @@
     "test": "node --experimental-ffi --test --test-isolation=none tests/*.test.js"
   },
   "devDependencies": {
-    "@opentui/core": "0.8.2",
+    "@opentui/core": "0.9.5",
     "esbuild": "0.28.2",
-    "string-width": "8.3.0",
+    "string-width": "9.0.0",
     "yaml": "2.9.1"
   }
 }
